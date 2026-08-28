@@ -176,6 +176,9 @@ export async function openReader(fileId, jumpToPage, pageList, pageListLabel){
     const doc = await loadPdfDocumentSafely(rawBuffer);
     window.State.currentDoc = doc;
     window.State.numPages = doc.numPages;
+    if (typeof applyOrientationLock === 'function') {
+      applyOrientationLock(window.State.screenOrientationMode || 'auto');
+    }
     await mountReaderContent();
   }catch(err){
     if(err && (err.name === 'PasswordException' || err.message?.toLowerCase().includes('password'))){
@@ -1933,6 +1936,9 @@ export function renderReaderShell(){
       window.State.pageList=null;
       window.State.pageListLabel='';
       releaseWakeLock();
+      if (window.screen?.orientation?.unlock) {
+        try { window.screen.orientation.unlock(); } catch(e) {}
+      }
       window.render();
     };
 

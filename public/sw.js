@@ -1,5 +1,5 @@
 // S.A.Y.A.D. Service Worker for Offline Study & Native WebAPK Minting
-const CACHE_NAME = 'sayad-v14-humor-exit-rewrite';
+const CACHE_NAME = 'sayad-v18-classic-theme-default';
 const PRECACHE_URLS = [
   '/',
   '/index.html',

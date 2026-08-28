@@ -169,103 +169,10 @@ export async function forceAppUpdateAndRefresh(isPull = false) {
 }
 
 /**
- * Mobile Pull-To-Refresh Touch Gesture Handler
+ * Mobile Pull-To-Refresh Gesture (Disabled to prevent accidental reload during normal scrolling)
  */
 export function initPullToRefresh() {
-  let startY = 0;
-  let currentY = 0;
-  let isPulling = false;
-  let indicator = null;
-
-  function getIndicator() {
-    let el = document.getElementById('sayad-pull-indicator');
-    if (!el) {
-      el = document.createElement('div');
-      el.id = 'sayad-pull-indicator';
-      el.style.cssText = `
-        position: fixed;
-        top: -60px;
-        left: 50%;
-        transform: translateX(-50%);
-        background: var(--surface, #1e293b);
-        color: var(--accent, #FF6A2B);
-        border: 1px solid var(--border, rgba(255,255,255,0.1));
-        padding: 8px 16px;
-        border-radius: 30px;
-        font-size: 12px;
-        font-weight: 700;
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        box-shadow: 0 4px 16px rgba(0,0,0,0.25);
-        z-index: 99999;
-        transition: top 0.15s ease-out, opacity 0.15s ease-out;
-        pointer-events: none;
-        opacity: 0;
-      `;
-      el.innerHTML = `<span style="display:inline-block; transition:transform 0.2s;" id="sayad-pull-arrow">↓</span> <span id="sayad-pull-text">Pull to refresh</span>`;
-      document.body.appendChild(el);
-    }
-    return el;
-  }
-
-  window.addEventListener('touchstart', (e) => {
-    // Only trigger if at the very top of the page and not in reader scroll
-    if (window.scrollY <= 2 && window.State?.view !== 'reader' && e.touches.length === 1) {
-      startY = e.touches[0].pageY;
-      isPulling = true;
-    } else {
-      isPulling = false;
-    }
-  }, { passive: true });
-
-  window.addEventListener('touchmove', (e) => {
-    if (!isPulling || window.scrollY > 5) {
-      isPulling = false;
-      const ind = document.getElementById('sayad-pull-indicator');
-      if (ind) { ind.style.top = '-60px'; ind.style.opacity = '0'; }
-      return;
-    }
-    currentY = e.touches[0].pageY;
-    const diff = currentY - startY;
-
-    if (diff > 20) {
-      const ind = getIndicator();
-      const pullProgress = Math.min(diff * 0.45, 75);
-      ind.style.top = `${pullProgress}px`;
-      ind.style.opacity = '1';
-
-      const arrow = document.getElementById('sayad-pull-arrow');
-      const text = document.getElementById('sayad-pull-text');
-      if (diff > 80) {
-        if (arrow) arrow.style.transform = 'rotate(180deg)';
-        if (text) text.textContent = 'Release to update';
-      } else {
-        if (arrow) arrow.style.transform = 'rotate(0deg)';
-        if (text) text.textContent = 'Pull to refresh';
-      }
-    }
-  }, { passive: true });
-
-  window.addEventListener('touchend', (e) => {
-    if (!isPulling) return;
-    const diff = currentY - startY;
-    isPulling = false;
-    startY = 0;
-    currentY = 0;
-
-    const ind = document.getElementById('sayad-pull-indicator');
-    if (diff > 80) {
-      if (ind) {
-        ind.innerHTML = `<span>🔄</span> <span>Updating app…</span>`;
-        ind.style.top = '65px';
-      }
-      forceAppUpdateAndRefresh(true);
-    } else if (ind) {
-      ind.style.top = '-60px';
-      ind.style.opacity = '0';
-    }
-  }, { passive: true });
+  // Intentionally disabled: Prevents unwanted app restarts while scrolling near top
 }
 
 // 6. Global PWA Event Listeners
@@ -274,8 +181,6 @@ export function initPWAListeners() {
   isInitialized = true;
 
   registerServiceWorker();
-  lockPortraitOrientation();
-  initPullToRefresh();
 
   // If captured in index.html head
   if (window.deferredInstallPrompt) {

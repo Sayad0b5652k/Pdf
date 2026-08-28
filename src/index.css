@@ -70,6 +70,10 @@ html[data-theme="sepia"] {
 
 html, body {
   height: 100%;
+  width: 100%;
+  overflow: hidden;
+  position: fixed;
+  inset: 0;
 }
 
 body {
@@ -80,11 +84,6 @@ body {
   overflow: hidden;
   overscroll-behavior: none;
   transition: background .4s var(--ease), color .4s var(--ease);
-  /* App-wide: behave like a native app, not a webpage. The PDF reader has
-     its own deliberate, custom-controlled text selection system (see
-     setupReaderInteractions) — this default covers everywhere else
-     (dashboard, bookmarks, notes, settings), which was still allowing
-     native long-press selection and pinch/double-tap page zoom. */
   -webkit-user-select: none;
   user-select: none;
   -webkit-touch-callout: none;
@@ -130,9 +129,10 @@ button {
 }
 
 #app {
-  position: relative;
-  height: 100dvh;
-  width: 100vw;
+  position: fixed;
+  inset: 0;
+  height: 100%;
+  width: 100%;
   overflow: hidden;
 }
 
@@ -141,6 +141,8 @@ button {
   inset: 0;
   overflow-y: auto;
   overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-y: contain;
 }
 
 /* ---------- shared primitives ---------- */

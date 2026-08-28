@@ -405,7 +405,7 @@ export async function boot(){
   window.State.theme = await window.DB.getSetting('theme','light');
   document.documentElement.dataset.theme = window.State.theme;
   try { localStorage.setItem('sayad_theme', window.State.theme); } catch(e){}
-  window.State.proTheme = await window.DB.getSetting('proTheme','titanium');
+  window.State.proTheme = await window.DB.getSetting('proTheme','classic');
   document.documentElement.dataset.proTheme = window.State.proTheme;
   try { localStorage.setItem('sayad_pro_theme', window.State.proTheme); } catch(e){}
   syncThemeColorMeta();
@@ -422,6 +422,7 @@ export async function boot(){
   window.State.autoScrollEnabled = await window.DB.getSetting('autoScrollEnabled', false);
   window.State.readAloudOledVisualizer = await window.DB.getSetting('readAloudOledVisualizer', true);
   window.State.alphaWavesEnabled = await window.DB.getSetting('alphaWavesEnabled', false);
+  window.State.screenOrientationMode = await window.DB.getSetting('screenOrientationMode', 'auto');
   if (typeof window.updateSystemImmersiveMode === 'function') {
     window.updateSystemImmersiveMode();
   } else if (typeof window.applyAdvancedReaderSettings === 'function') {

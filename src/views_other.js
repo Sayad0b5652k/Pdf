@@ -61,17 +61,17 @@ export async function renderSettings(){
     <div class="card" style="padding:14px; margin-bottom:22px;">
       <div style="display:grid; grid-template-columns:repeat(4, 1fr); gap:6px;">
         <button data-set-pro-theme="classic" class="btn" style="flex-direction:column; padding:10px 4px; height:74px; gap:3px; font-size:10.5px; font-weight:700; border-radius:10px;
-          background:${(window.State.proTheme==='classic')?'var(--accent-soft)':'var(--surface-2)'};
-          color:${(window.State.proTheme==='classic')?'var(--accent)':'var(--text)'};
-          border:1.5px solid ${(window.State.proTheme==='classic')?'var(--accent)':'var(--border)'};">
+          background:${((window.State.proTheme||'classic')==='classic')?'var(--accent-soft)':'var(--surface-2)'};
+          color:${((window.State.proTheme||'classic')==='classic')?'var(--accent)':'var(--text)'};
+          border:1.5px solid ${((window.State.proTheme||'classic')==='classic')?'var(--accent)':'var(--border)'};">
           <span style="font-size:17px;">🏛️</span>
           <span>Classic</span>
           <span style="font-size:9px; opacity:0.75; font-weight:500;">Original Look</span>
         </button>
         <button data-set-pro-theme="titanium" class="btn" style="flex-direction:column; padding:10px 4px; height:74px; gap:3px; font-size:10.5px; font-weight:700; border-radius:10px;
-          background:${((window.State.proTheme||'titanium')==='titanium')?'var(--accent-soft)':'var(--surface-2)'};
-          color:${((window.State.proTheme||'titanium')==='titanium')?'var(--accent)':'var(--text)'};
-          border:1.5px solid ${((window.State.proTheme||'titanium')==='titanium')?'var(--accent)':'var(--border)'};">
+          background:${(window.State.proTheme==='titanium')?'var(--accent-soft)':'var(--surface-2)'};
+          color:${(window.State.proTheme==='titanium')?'var(--accent)':'var(--text)'};
+          border:1.5px solid ${(window.State.proTheme==='titanium')?'var(--accent)':'var(--border)'};">
           <span style="font-size:17px;">⚡</span>
           <span>Titanium</span>
           <span style="font-size:9px; opacity:0.75; font-weight:500;">Precision Slate</span>

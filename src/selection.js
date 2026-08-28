@@ -222,15 +222,45 @@ export function extractContextSentence(range, pageWrap){
   return '';
 }
 
-export function caretFromPoint(x,y){
-  if(document.caretRangeFromPoint) return document.caretRangeFromPoint(x,y);
-  if(document.caretPositionFromPoint){
-    const pos = document.caretPositionFromPoint(x,y);
-    if(!pos) return null;
+export function createSafeRange(startNode, startOffset, endNode, endOffset) {
+  try {
+    if (!startNode) return null;
     const r = document.createRange();
-    r.setStart(pos.offsetNode, pos.offset);
-    r.collapse(true);
+    
+    // Clamp startOffset
+    const maxStart = startNode.nodeType === Node.TEXT_NODE 
+      ? (startNode.textContent ? startNode.textContent.length : 0) 
+      : (startNode.childNodes ? startNode.childNodes.length : 0);
+    const clampedStart = Math.min(maxStart, Math.max(0, Number(startOffset) || 0));
+    r.setStart(startNode, clampedStart);
+
+    if (endNode !== undefined) {
+      const actualEndNode = endNode || startNode;
+      const maxEnd = actualEndNode.nodeType === Node.TEXT_NODE 
+        ? (actualEndNode.textContent ? actualEndNode.textContent.length : 0) 
+        : (actualEndNode.childNodes ? actualEndNode.childNodes.length : 0);
+      const clampedEnd = Math.min(maxEnd, Math.max(0, Number(endOffset !== undefined ? endOffset : clampedStart) || 0));
+      r.setEnd(actualEndNode, clampedEnd);
+    } else {
+      r.collapse(true);
+    }
     return r;
+  } catch (err) {
+    console.warn('createSafeRange warning:', err);
+    return null;
+  }
+}
+
+export function caretFromPoint(x,y){
+  try {
+    if(document.caretRangeFromPoint) return document.caretRangeFromPoint(x,y);
+    if(document.caretPositionFromPoint){
+      const pos = document.caretPositionFromPoint(x,y);
+      if(!pos || !pos.offsetNode) return null;
+      return createSafeRange(pos.offsetNode, pos.offset);
+    }
+  } catch(e) {
+    console.warn('caretFromPoint warning:', e);
   }
   return null;
 }
@@ -254,41 +284,55 @@ export function findSpanAtPoint(pageNum, x, y){
 }
 
 export function caretFromPointOnPage(pageNum, viewportX, viewportY){
-  const pe = window.pageEls[pageNum];
-  if(!pe) return null;
-  const wrapRect = pe.wrap.getBoundingClientRect();
-  const x = viewportX - wrapRect.left, y = viewportY - wrapRect.top;
-  const entry = findSpanAtPoint(pageNum, x, y);
-  if(!entry) return null;
-  const textNode = entry.span.firstChild;
-  const text = textNode ? textNode.textContent : '';
-  if(!textNode || !text) return null;
-  const ratio = Math.min(1, Math.max(0, (x-entry.rect.left)/(entry.rect.width||1)));
-  const idx = Math.min(text.length, Math.max(0, Math.round(ratio*text.length)));
-  const r = document.createRange();
-  r.setStart(textNode, idx);
-  r.collapse(true);
-  return r;
+  try {
+    const pe = window.pageEls[pageNum];
+    if(!pe) return null;
+    const wrapRect = pe.wrap.getBoundingClientRect();
+    const x = viewportX - wrapRect.left, y = viewportY - wrapRect.top;
+    const entry = findSpanAtPoint(pageNum, x, y);
+    if(!entry) return null;
+    const textNode = entry.span.firstChild;
+    const text = textNode ? textNode.textContent : '';
+    if(!textNode || !text) return null;
+    const ratio = Math.min(1, Math.max(0, (x-entry.rect.left)/(entry.rect.width||1)));
+    const idx = Math.min(text.length, Math.max(0, Math.round(ratio*text.length)));
+    return createSafeRange(textNode, idx);
+  } catch(e) {
+    console.warn('caretFromPointOnPage warning:', e);
+    return null;
+  }
 }
 
 export function wordRangeAtCaret(caretRange){
-  let node = caretRange.startContainer;
-  let offset = caretRange.startOffset;
-  if(node.nodeType !== Node.TEXT_NODE){
-    const child = node.childNodes[offset] || node.childNodes[offset-1];
-    if(child && child.nodeType===Node.TEXT_NODE){ node = child; offset = 0; }
-    else return caretRange;
+  if (!caretRange) return null;
+  try {
+    let node = caretRange.startContainer;
+    let offset = caretRange.startOffset;
+    if(!node) return caretRange;
+    if(node.nodeType !== Node.TEXT_NODE){
+      const childCount = node.childNodes ? node.childNodes.length : 0;
+      if (childCount === 0) return caretRange;
+      const validOffset = Math.min(childCount - 1, Math.max(0, offset));
+      const child = node.childNodes[validOffset];
+      if(child && child.nodeType===Node.TEXT_NODE){ 
+        node = child; 
+        offset = 0; 
+      } else { 
+        return caretRange; 
+      }
+    }
+    const text = node.textContent || '';
+    const isWordChar = ch => !!ch && !/[\s.,;:!?()"'\u201c\u201d\[\]{}]/.test(ch);
+    let start = Math.min(text.length, Math.max(0, offset));
+    let end = start;
+    while(start>0 && isWordChar(text[start-1])) start--;
+    while(end<text.length && isWordChar(text[end])) end++;
+    if(start===end){ end = Math.min(text.length, start+1); }
+    return createSafeRange(node, start, node, end) || caretRange;
+  } catch(e) {
+    console.warn('wordRangeAtCaret warning:', e);
+    return caretRange;
   }
-  const text = node.textContent || '';
-  const isWordChar = ch => !!ch && !/[\s.,;:!?()"'\u201c\u201d\[\]{}]/.test(ch);
-  let start = offset, end = offset;
-  while(start>0 && isWordChar(text[start-1])) start--;
-  while(end<text.length && isWordChar(text[end])) end++;
-  if(start===end){ end = Math.min(text.length, start+1); }
-  const r = document.createRange();
-  r.setStart(node, start);
-  r.setEnd(node, end);
-  return r;
 }
 
 export function comparePoints(nodeA, offsetA, nodeB, offsetB){
@@ -301,36 +345,39 @@ export function comparePoints(nodeA, offsetA, nodeB, offsetB){
 
 export function buildExtendedRange(anchorStart, anchorEnd, focusCaret){
   try{
+    if(!focusCaret || !anchorStart || !anchorEnd) return null;
     const focusNode = focusCaret.startContainer, focusOffset = focusCaret.startOffset;
+    if(!focusNode || !anchorStart.node || !anchorEnd.node) return null;
     const cmpToStart = comparePoints(focusNode, focusOffset, anchorStart.node, anchorStart.offset);
     const cmpToEnd = comparePoints(focusNode, focusOffset, anchorEnd.node, anchorEnd.offset);
-    const r = document.createRange();
     if(cmpToStart < 0){
-      r.setStart(focusNode, focusOffset);
-      r.setEnd(anchorEnd.node, anchorEnd.offset);
+      return createSafeRange(focusNode, focusOffset, anchorEnd.node, anchorEnd.offset);
     } else if(cmpToEnd > 0){
-      r.setStart(anchorStart.node, anchorStart.offset);
-      r.setEnd(focusNode, focusOffset);
+      return createSafeRange(anchorStart.node, anchorStart.offset, focusNode, focusOffset);
     } else {
-      r.setStart(anchorStart.node, anchorStart.offset);
-      r.setEnd(anchorEnd.node, anchorEnd.offset);
+      return createSafeRange(anchorStart.node, anchorStart.offset, anchorEnd.node, anchorEnd.offset);
     }
-    return r;
   }catch(err){
+    console.warn('buildExtendedRange warning:', err);
     return null;
   }
 }
 
 export function snapRangeToWholeWords(range){
   try{
-    const startWord = wordRangeAtCaret((()=>{ const r=document.createRange(); r.setStart(range.startContainer,range.startOffset); r.collapse(true); return r; })());
-    const endCaret = (()=>{ const r=document.createRange(); r.setStart(range.endContainer,range.endOffset); r.collapse(true); return r; })();
+    if (!range) return range;
+    const startCaret = createSafeRange(range.startContainer, range.startOffset);
+    if (!startCaret) return range;
+    const startWord = wordRangeAtCaret(startCaret);
+    
+    const endCaret = createSafeRange(range.endContainer, range.endOffset);
+    if (!endCaret) return range;
     const endWord = wordRangeAtCaret(endCaret);
-    const snapped = document.createRange();
-    snapped.setStart(startWord.startContainer, startWord.startOffset);
-    snapped.setEnd(endWord.endContainer, endWord.endOffset);
-    return snapped;
+
+    if (!startWord || !endWord) return range;
+    return createSafeRange(startWord.startContainer, startWord.startOffset, endWord.endContainer, endWord.endOffset) || range;
   }catch(err){
+    console.warn('snapRangeToWholeWords warning:', err);
     return range;
   }
 }

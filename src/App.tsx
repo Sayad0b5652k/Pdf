@@ -164,24 +164,17 @@ export default function App() {
     }
 
     // -------------------------------------------------------------
-    // CINEMATIC 6.5s TIMELINE SEQUENCER
+    // CONTINUOUS FLUID TIMELINE SEQUENCER (Zero Jumping, 60fps Motion)
     // -------------------------------------------------------------
-    const updateProgress = (pct: number, statusText: string) => {
-      const fillEl = document.getElementById('splash-fill');
-      const statusEl = document.getElementById('splash-status');
-      const pctEl = document.getElementById('splash-pct');
-      if (fillEl) fillEl.style.width = `${pct}%`;
-      if (statusEl) statusEl.textContent = statusText;
-      if (pctEl) pctEl.textContent = `${pct}%`;
-    };
-
     let cancelled = false;
+    let progressAnimId: number | null = null;
 
     const fullQuote = '“Small daily study habits yield masterly academic growth.”';
 
     const dismissSplash = () => {
       if (cancelled) return;
       cancelled = true;
+      if (progressAnimId) cancelAnimationFrame(progressAnimId);
       const splashEl = document.getElementById('sayad-splash');
       if (splashEl) {
         splashEl.classList.add('splash-dissolve');
@@ -199,59 +192,99 @@ export default function App() {
       }
     };
 
-    const run6SecSequence = async () => {
-      // 0.0s -> 1.0s: Phase 1 (Awakening & DB Boot)
-      updateProgress(12, '⚡ Initializing S.A.Y.A.D. Core Engine…');
-      
-      if (typeof (window as any).boot === 'function') {
-        (window as any).boot().catch(console.error);
-      }
-      
-      await new Promise((r) => setTimeout(r, 1100));
-      if (cancelled) return;
+    // Boot database in parallel immediately
+    if (typeof (window as any).boot === 'function') {
+      (window as any).boot().catch(console.error);
+    }
 
-      // 1.1s -> 2.8s: Phase 2 (Activating Feature Modules)
-      updateProgress(28, '📄 Activating PDF Annotator & Reader…');
-      setActiveChips([0]);
-      await new Promise((r) => setTimeout(r, 450));
-      if (cancelled) return;
+    const runContinuousSequence = () => {
+      const startTime = performance.now();
+      const totalDuration = 4800; // 4.8s total smooth sequence
 
-      updateProgress(42, '🧠 Synchronizing FSRS Spaced Repetition engine…');
-      setActiveChips([0, 1]);
-      await new Promise((r) => setTimeout(r, 450));
-      if (cancelled) return;
+      const fillEl = document.getElementById('splash-fill');
+      const statusEl = document.getElementById('splash-status');
+      const pctEl = document.getElementById('splash-pct');
 
-      updateProgress(58, '🤖 Connecting Gemini AI Study Assistant…');
-      setActiveChips([0, 1, 2]);
-      await new Promise((r) => setTimeout(r, 450));
-      if (cancelled) return;
+      let lastPhase = -1;
+      let lastTypeChar = 0;
 
-      updateProgress(68, '📈 Loading Reading Retention & Goal tracker…');
-      setActiveChips([0, 1, 2, 3]);
-      await new Promise((r) => setTimeout(r, 550));
-      if (cancelled) return;
+      const tick = (now: number) => {
+        if (cancelled) return;
+        const elapsed = Math.max(0, now - startTime);
+        const rawProgress = Math.min(1, elapsed / totalDuration);
 
-      // 2.9s -> 4.8s: Phase 3 (Typing Quote & FSRS Calibration)
-      updateProgress(82, '🎯 Calibrating memory retrievability matrix…');
-      for (let i = 1; i <= fullQuote.length; i++) {
-        if (cancelled) break;
-        setTypedQuote(fullQuote.slice(0, i));
-        await new Promise((r) => setTimeout(r, 32));
-      }
-      if (cancelled) return;
-      await new Promise((r) => setTimeout(r, 400));
-      if (cancelled) return;
+        // Smooth cubic-out easing curve for natural fluid deceleration
+        const eased = rawProgress < 0.8
+          ? rawProgress / 0.8 * 0.85
+          : 0.85 + (rawProgress - 0.8) / 0.2 * 0.15;
 
-      // 4.9s -> 6.0s: Phase 4 (Workspace Ready)
-      updateProgress(100, '✨ Academic Workspace Ready! Opening…');
-      await new Promise((r) => setTimeout(r, 650));
-      if (cancelled) return;
+        const currentPct = Math.min(100, Math.floor(eased * 100));
 
-      // Phase 5 (Grand Entrance Reveal)
-      dismissSplash();
+        // Update progress bar width and counter continuously
+        if (fillEl) fillEl.style.width = `${(eased * 100).toFixed(1)}%`;
+        if (pctEl) pctEl.textContent = `${currentPct}%`;
+
+        // Continuous Phase & Status updates
+        if (currentPct < 22) {
+          if (lastPhase !== 0) {
+            lastPhase = 0;
+            if (statusEl) statusEl.textContent = '⚡ Initializing S.A.Y.A.D. Core Engine…';
+          }
+        } else if (currentPct < 45) {
+          if (lastPhase !== 1) {
+            lastPhase = 1;
+            if (statusEl) statusEl.textContent = '📄 Activating PDF Annotator & Reader…';
+            setActiveChips([0]);
+          }
+        } else if (currentPct < 65) {
+          if (lastPhase !== 2) {
+            lastPhase = 2;
+            if (statusEl) statusEl.textContent = '🧠 Synchronizing FSRS Spaced Repetition engine…';
+            setActiveChips([0, 1]);
+          }
+        } else if (currentPct < 85) {
+          if (lastPhase !== 3) {
+            lastPhase = 3;
+            if (statusEl) statusEl.textContent = '🤖 Connecting Gemini AI Study Assistant…';
+            setActiveChips([0, 1, 2]);
+          }
+        } else if (currentPct < 96) {
+          if (lastPhase !== 4) {
+            lastPhase = 4;
+            if (statusEl) statusEl.textContent = '📈 Loading Reading Retention & Goal tracker…';
+            setActiveChips([0, 1, 2, 3]);
+          }
+        } else {
+          if (lastPhase !== 5) {
+            lastPhase = 5;
+            if (statusEl) statusEl.textContent = '✨ Academic Workspace Ready! Opening…';
+            setActiveChips([0, 1, 2, 3]);
+          }
+        }
+
+        // Smooth Typing quote progression
+        const quoteProgress = Math.max(0, Math.min(1, (rawProgress - 0.35) / 0.55));
+        const charsToShow = Math.floor(quoteProgress * fullQuote.length);
+        if (charsToShow !== lastTypeChar) {
+          lastTypeChar = charsToShow;
+          setTypedQuote(fullQuote.slice(0, charsToShow));
+        }
+
+        if (rawProgress < 1) {
+          progressAnimId = requestAnimationFrame(tick);
+        } else {
+          if (fillEl) fillEl.style.width = '100%';
+          if (pctEl) pctEl.textContent = '100%';
+          setTimeout(() => {
+            dismissSplash();
+          }, 350);
+        }
+      };
+
+      progressAnimId = requestAnimationFrame(tick);
     };
 
-    run6SecSequence();
+    runContinuousSequence();
 
     (window as any).skipSplash = () => {
       dismissSplash();
@@ -259,6 +292,7 @@ export default function App() {
 
     return () => {
       cancelled = true;
+      if (progressAnimId) cancelAnimationFrame(progressAnimId);
       if (animId) cancelAnimationFrame(animId);
     };
   }, []);

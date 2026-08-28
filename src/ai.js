@@ -2978,9 +2978,13 @@ export async function runDictionaryLookup(sel){
       const aiExplainBtn = document.getElementById('dict-ai-explain-btn');
       if (aiExplainBtn) {
         aiExplainBtn.onclick = () => {
-          window.Sheet.close();
-          if (window.openAcademicChat) {
-            window.openAcademicChat(`Explain the academic word "${word}" in depth, its exact nuances, and how it is used in examinations.`);
+          if (window.Sheet && window.Sheet.close) window.Sheet.close();
+          const query = `Explain the academic word "${word}" in depth, its exact nuances, and how it is used in examinations.`;
+          if (typeof window.openAIChat === 'function') {
+            window.openAIChat(query);
+          } else if (typeof window.openTeacherView === 'function') {
+            const fid = window.State?.currentFile?.id || 'global_chat';
+            window.openTeacherView(query, 'professional', fid);
           }
         };
       }
@@ -4116,24 +4120,77 @@ Format:
   };
 }
 
+export async function translatePassageAI(text, targetLang) {
+  const cleanText = (text || '').trim();
+  const isShortWord = cleanText.split(/\s+/).length <= 4;
+
+  const systemInstruction = `You are a world-class academic translator, linguist, and bilingual educator.
+Your task is to translate the user's text into ${targetLang} with utmost accuracy, natural fluency, and professional clarity.
+
+STRICT TRANSLATION RULES:
+1. If the input is a single word or short term:
+   - Provide the primary, most accurate translation prominently at the top.
+   - Include clear phonetic pronunciation / transliteration if the script differs (e.g. Hindi, Arabic, Russian, Chinese, Japanese).
+   - State the grammatical category (Noun, Verb, Adjective, etc.).
+   - List 2-3 accurate contextual synonyms or alternate translations in ${targetLang}.
+   - Provide 1-2 practical, realistic example sentences with parallel translations in both languages.
+2. If the input is a phrase, sentence, or passage:
+   - Provide a natural, fluent, and precise translation of the entire passage directly.
+   - If there are nuanced, idiomatic, or academic terms, provide a brief bulleted vocabulary breakdown below.
+3. Strict Output Constraints:
+   - NEVER output ASCII art diagrams, mock chemical drawings, long philosophical essays, or unrendered LaTeX markers.
+   - Output structured, clean Markdown with clear headings (###), bold key terms (**word**), and bullet points (-).
+   - Keep the response clean, direct, and immediately readable.`;
+
+  const prompt = isShortWord
+    ? `Translate the word/term "${cleanText}" into ${targetLang}.`
+    : `Translate the following passage accurately and naturally into ${targetLang}:\n\n"""${cleanText}"""`;
+
+  // 1. Try server general Gemini endpoint with dedicated translation system instruction
+  try {
+    const res = await callServerGemini(prompt, systemInstruction, 'gemini-3.1-flash-lite');
+    if (res && res.length > 3) return res;
+  } catch (e) {
+    console.warn('Translate primary callServerGemini notice:', e.message);
+  }
+
+  // 2. Try study tool endpoint
+  try {
+    const studyRes = await callStudyTool('translate', prompt, cleanText);
+    if (studyRes && studyRes.length > 3) return studyRes;
+  } catch (e) {
+    console.warn('Translate study tool fallback notice:', e.message);
+  }
+
+  // 3. Fallback to basic prompt
+  return await callAI(prompt, 'translate', cleanText);
+}
+
 export async function runTranslateToolModal(sel){
   if(!sel || !sel.text) return;
-  const langs = ['Spanish', 'French', 'German', 'Hindi', 'Chinese', 'Japanese', 'Arabic', 'Russian', 'Portuguese', 'Italian', 'Korean'];
+  const langs = [
+    'Hindi', 'Urdu', 'Spanish', 'French', 'German', 
+    'Arabic', 'Bengali', 'Marathi', 'Tamil', 'Telugu', 'Gujarati', 
+    'Russian', 'Chinese', 'Japanese', 'Korean', 'Italian', 'Portuguese', 'Turkish'
+  ];
+
   window.Sheet.open(`
     <div style="padding:4px 0;">
-      <div class="font-display" style="font-size:18px; font-weight:700; margin-bottom:8px; display:flex; align-items:center; gap:8px;">
+      <div class="font-display" style="font-size:18px; font-weight:700; margin-bottom:10px; display:flex; align-items:center; gap:8px;">
         ${window.icon('language','icon icon-sm')} Translate Selection
       </div>
-      <div style="font-size:12.5px; color:var(--text-dim); margin-bottom:12px; background:var(--surface-2); padding:8px 10px; border-radius:6px; max-height:48px; overflow:hidden;">
-        "${window.escapeHtml((sel?.text || '').slice(0, 110))}"
+      <div style="font-size:12.5px; color:var(--text-dim); margin-bottom:14px; background:var(--surface-2); border:1px solid var(--border); padding:9px 12px; border-radius:10px; max-height:60px; overflow-y:auto; line-height:1.45;">
+        "${window.escapeHtml((sel?.text || '').slice(0, 200))}"
       </div>
-      <div style="margin-bottom:12px;">
-        <label style="font-size:12px; font-weight:600; color:var(--text-dim); display:block; margin-bottom:6px;">Target Language</label>
-        <select id="trans-lang-select" style="width:100%; padding:10px 12px; font-size:13.5px; background:var(--surface-2); border:1px solid var(--border); border-radius:var(--radius-sm); color:var(--text);">
+      <div style="margin-bottom:14px;">
+        <label style="font-size:12px; font-weight:700; color:var(--text-dim); display:block; margin-bottom:6px;">Target Language</label>
+        <select id="trans-lang-select" style="width:100%; padding:10px 12px; font-size:14px; font-weight:600; background:var(--surface-2); border:1px solid var(--border); border-radius:10px; color:var(--text);">
           ${langs.map(l => `<option value="${l}">${l}</option>`).join('')}
         </select>
       </div>
-      <button class="btn btn-primary" id="start-trans-btn" style="width:100%; padding:12px; font-weight:600; margin-bottom:14px;">Translate</button>
+      <button class="btn btn-primary" id="start-trans-btn" style="width:100%; padding:12px; font-weight:700; font-size:14px; margin-bottom:14px; border-radius:10px; box-shadow:0 3px 12px var(--accent-soft);">
+        ${window.icon('language','icon icon-xs')} Translate Now
+      </button>
       <div id="trans-result-box"></div>
     </div>
   `);
@@ -4142,43 +4199,57 @@ export async function runTranslateToolModal(sel){
     const targetLang = document.getElementById('trans-lang-select').value;
     const resBox = document.getElementById('trans-result-box');
     resBox.innerHTML = `
-      <div style="padding:12px; background:var(--surface-2); border-radius:8px;">
-        <div class="skel" style="height:14px; width:90%; margin-bottom:6px;"></div>
-        <div class="skel" style="height:14px; width:70%;"></div>
+      <div style="padding:16px; background:var(--surface-2); border-radius:12px; border:1px solid var(--border);">
+        <div style="display:flex; align-items:center; gap:8px; margin-bottom:10px; color:var(--accent); font-weight:700; font-size:13px;">
+          <span style="display:inline-block; animation:spin 1s linear infinite;">⏳</span> Translating into ${targetLang}...
+        </div>
+        <div class="skel" style="height:14px; width:95%; margin-bottom:8px; border-radius:4px;"></div>
+        <div class="skel" style="height:14px; width:80%; margin-bottom:8px; border-radius:4px;"></div>
+        <div class="skel" style="height:14px; width:60%; border-radius:4px;"></div>
       </div>
     `;
 
-    const prompt = `Translate the following passage accurately and naturally into ${targetLang}:\n\n"""${sel.text}"""`;
     try {
-      const translation = await callAI(prompt);
+      const translation = await translatePassageAI(sel.text, targetLang);
+      const renderedHtml = typeof window.renderMarkdown === 'function' 
+        ? window.renderMarkdown(translation) 
+        : (typeof window.formatMarkdown === 'function' ? window.formatMarkdown(translation) : window.escapeHtml(translation));
+
       resBox.innerHTML = `
-        <div style="background:var(--surface-2); border:1px solid var(--border); border-radius:8px; padding:12px; font-size:14px; line-height:1.6; color:var(--text); margin-bottom:12px;">
-          ${window.escapeHtml(translation)}
+        <div class="selectable-text" style="background:var(--surface-2); border:1px solid var(--border); border-radius:12px; padding:14px 16px; font-size:13.5px; line-height:1.65; color:var(--text); margin-bottom:14px; max-height:360px; overflow-y:auto;">
+          ${renderedHtml}
         </div>
         <div style="display:flex; gap:8px;">
-          <button class="btn btn-ghost" id="copy-trans-btn" style="flex:1; padding:10px;">Copy Translation</button>
-          <button class="btn btn-primary" id="save-trans-note" style="flex:1; padding:10px;">Save to Notes</button>
+          <button class="btn btn-ghost" id="copy-trans-btn" style="flex:1; padding:10px 12px; font-weight:700; font-size:12.5px; border-radius:10px; border:1px solid var(--border); display:flex; align-items:center; justify-content:center; gap:6px;">
+            ${window.icon('copy','icon icon-xs')} Copy
+          </button>
+          <button class="btn btn-primary" id="save-trans-note" style="flex:1; padding:10px 12px; font-weight:700; font-size:12.5px; border-radius:10px; display:flex; align-items:center; justify-content:center; gap:6px;">
+            ${window.icon('bookmark','icon icon-xs')} Save to Notes
+          </button>
         </div>
       `;
+
       document.getElementById('copy-trans-btn').onclick = async () => {
         await window.copyToClipboard(translation);
-        window.toast('Copied translation!');
+        window.toast('Translation copied to clipboard! 📋');
       };
+
       document.getElementById('save-trans-note').onclick = async () => {
         await window.DB.put('notes', {
           id: window.uid(),
-          fileId: window.State.currentFile.id,
-          page: sel.pageNum,
+          fileId: window.State?.currentFile?.id || 'global_notes',
+          page: sel.pageNum || 1,
           kind: `Translation (${targetLang})`,
           content: translation,
           sourceText: sel.text,
           createdAt: Date.now()
         });
-        window.toast('Translation saved to Notes!');
+        window.toast(`Translation saved to Notes! 📝`);
         window.Sheet.close();
       };
     } catch (err) {
-      resBox.innerHTML = `<div style="color:var(--danger); font-size:13px;">Translation failed. Please try again.</div>`;
+      console.error('Translation error:', err);
+      resBox.innerHTML = `<div style="color:var(--danger); font-size:13px; padding:12px; background:rgba(239,68,68,0.1); border-radius:10px;">Translation failed. Please check your internet connection or API settings.</div>`;
     }
   };
 }
@@ -6415,6 +6486,7 @@ window.callGroq = callGroq;
 window.runMCQGeneratorModal = runMCQGeneratorModal;
 window.runInteractiveFlashcardsModal = runInteractiveFlashcardsModal;
 window.runTranslateToolModal = runTranslateToolModal;
+window.translatePassageAI = translatePassageAI;
 window.runTTS = runTTS;
 window.skipTTSSentence = skipTTSSentence;
 window.clearTTSHighlights = clearTTSHighlights;

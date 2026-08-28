@@ -11,17 +11,17 @@ window.pageEls = pageEls;
 if (typeof window !== 'undefined' && window.pdfjsLib) {
   try {
     if (!window.pdfjsLib.GlobalWorkerOptions.workerSrc) {
-      window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://unpkg.com/pdfjs-dist@3.11.174/build/pdf.worker.min.js';
     }
   } catch(e) {}
 }
 
 export const PDFJS_LOAD_OPTS = {
-  cMapUrl: '/pdfjs/cmaps/',
+  cMapUrl: 'https://unpkg.com/pdfjs-dist@3.11.174/cmaps/',
   cMapPacked: true,
-  standardFontDataUrl: '/pdfjs/standard_fonts/',
+  standardFontDataUrl: 'https://unpkg.com/pdfjs-dist@3.11.174/standard_fonts/',
   disableFontFace: false,
-  useSystemFonts: true,
+  useSystemFonts: false,
   stopAtErrors: false,
   verbosity: 0,
 };
@@ -29,7 +29,7 @@ window.PDFJS_LOAD_OPTS = PDFJS_LOAD_OPTS;
 
 /**
  * Multi-tier resilient PDF Document loader.
- * Gracefully tries primary Local bundle, CDN fallbacks, and direct parsing with FULL embedded font rendering.
+ * Gracefully tries primary unpkg CDN, fallback jsDelivr CDN, and direct parsing with FULL embedded font rendering.
  */
 export async function loadPdfDocumentSafely(rawBuffer, password = null) {
   if (!rawBuffer || rawBuffer.byteLength === 0) {
@@ -37,19 +37,19 @@ export async function loadPdfDocumentSafely(rawBuffer, password = null) {
   }
 
   // Ensure worker is configured
-  if (window.pdfjsLib && window.pdfjsLib.GlobalWorkerOptions && !window.pdfjsLib.GlobalWorkerOptions.workerSrc) {
-    window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+  if (window.pdfjsLib && window.pdfjsLib.GlobalWorkerOptions) {
+    window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://unpkg.com/pdfjs-dist@3.11.174/build/pdf.worker.min.js';
   }
 
-  // Tier 1: Local Bundled CMaps & Standard Fonts (Zero network dependency, instant offline reliability)
+  // Tier 1: Primary unpkg CDN with full CMaps & Standard Fonts (FoxitSerif, LiberationSans, etc.)
   try {
     const opts1 = {
       data: new Uint8Array(rawBuffer.slice(0)),
-      cMapUrl: '/pdfjs/cmaps/',
+      cMapUrl: 'https://unpkg.com/pdfjs-dist@3.11.174/cmaps/',
       cMapPacked: true,
-      standardFontDataUrl: '/pdfjs/standard_fonts/',
+      standardFontDataUrl: 'https://unpkg.com/pdfjs-dist@3.11.174/standard_fonts/',
       disableFontFace: false,
-      useSystemFonts: true,
+      useSystemFonts: false,
       stopAtErrors: false,
       verbosity: 0,
     };
@@ -60,18 +60,18 @@ export async function loadPdfDocumentSafely(rawBuffer, password = null) {
     if (err1 && (err1.name === 'PasswordException' || err1.message?.toLowerCase().includes('password'))) {
       throw err1;
     }
-    console.warn('[PDF Loader] Tier 1 (Local Fonts/CMaps) failed, trying Tier 2 (cdnjs CDN)...', err1?.message);
+    console.warn('[PDF Loader] Tier 1 (unpkg) failed, trying Tier 2 (jsDelivr CDN)...', err1?.message);
   }
 
-  // Tier 2: Fallback unpkg CDN with lenient error recovery
+  // Tier 2: Fallback jsDelivr CDN with complete standard fonts
   try {
     const opts2 = {
       data: new Uint8Array(rawBuffer.slice(0)),
-      cMapUrl: 'https://unpkg.com/pdfjs-dist@3.11.174/cmaps/',
+      cMapUrl: 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/cmaps/',
       cMapPacked: true,
-      standardFontDataUrl: 'https://unpkg.com/pdfjs-dist@3.11.174/standard_fonts/',
+      standardFontDataUrl: 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/standard_fonts/',
       disableFontFace: false,
-      useSystemFonts: true,
+      useSystemFonts: false,
       stopAtErrors: false,
       verbosity: 0,
     };
@@ -82,29 +82,7 @@ export async function loadPdfDocumentSafely(rawBuffer, password = null) {
     if (err2 && (err2.name === 'PasswordException' || err2.message?.toLowerCase().includes('password'))) {
       throw err2;
     }
-    console.warn('[PDF Loader] Tier 2 failed, trying Tier 2.5 (jsdelivr fallback CDN with Fonts)...', err2?.message);
-  }
-
-  // Tier 2.5: High-speed jsDelivr CDN fallback with full CMaps and Standard Fonts
-  try {
-    const opts2b = {
-      data: new Uint8Array(rawBuffer.slice(0)),
-      cMapUrl: 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/cmaps/',
-      cMapPacked: true,
-      standardFontDataUrl: 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/standard_fonts/',
-      disableFontFace: false,
-      useSystemFonts: true,
-      stopAtErrors: false,
-      verbosity: 0,
-    };
-    if (password) opts2b.password = password;
-    const task = window.pdfjsLib.getDocument(opts2b);
-    return await task.promise;
-  } catch (err2b) {
-    if (err2b && (err2b.name === 'PasswordException' || err2b.message?.toLowerCase().includes('password'))) {
-      throw err2b;
-    }
-    console.warn('[PDF Loader] Tier 2.5 failed, trying Tier 3 (Direct Byte Buffer)...', err2b?.message);
+    console.warn('[PDF Loader] Tier 2 failed, trying Tier 3 (Direct Byte Buffer)...', err2?.message);
   }
 
   // Tier 3: Direct TypedArray parser with standard font-face enabled
@@ -112,7 +90,7 @@ export async function loadPdfDocumentSafely(rawBuffer, password = null) {
     const opts3 = {
       data: new Uint8Array(rawBuffer.slice(0)),
       disableFontFace: false,
-      useSystemFonts: true,
+      useSystemFonts: false,
       stopAtErrors: false,
       verbosity: 0,
     };

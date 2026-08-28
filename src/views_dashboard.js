@@ -24,11 +24,8 @@ export async function renderDashboard(){
             </div>
           </div>
         </div>
-        <div style="display:flex; gap:8px;">
-          <button class="btn btn-ghost" id="btn-dash-refresh-app" title="Refresh & Check Updates (Safe - Zero Data Loss)" style="width:38px; height:38px; border-radius:12px; padding:0; display:flex; align-items:center; justify-content:center; background:var(--surface-2); border:1px solid var(--border); color:var(--text-dim); font-size:16px;">
-            🔄
-          </button>
-          <label class="btn btn-primary" for="file-input" id="btn-import" style="padding:9px 16px; border-radius:12px; font-size:13px; font-weight:700; gap:6px; box-shadow:0 3px 10px var(--accent-soft);">
+        <div>
+          <label class="btn btn-primary" for="file-input" id="btn-import" style="padding:9px 16px; border-radius:12px; font-size:13px; font-weight:700; gap:6px; box-shadow:0 3px 10px var(--accent-soft); cursor:pointer;">
             ${window.icon('plus','icon icon-sm')}
             <span>Import</span>
           </label>
@@ -71,17 +68,6 @@ export async function renderDashboard(){
 
   window.bindBottomNav();
   bindAIChatHistoryEvents();
-
-  const dashRefreshBtn = document.getElementById('btn-dash-refresh-app');
-  if (dashRefreshBtn) {
-    dashRefreshBtn.onclick = () => {
-      if (typeof window.forceAppUpdateAndRefresh === 'function') {
-        window.forceAppUpdateAndRefresh(false);
-      } else {
-        window.location.reload();
-      }
-    };
-  }
 
   document.getElementById('dash-search').oninput = window.debounce(async (e)=>{
     const q = e.target.value.trim();
@@ -497,6 +483,7 @@ export function openBookMenu(fileId){
   window.Sheet.open(`
     <div class="font-display" style="font-size:17px; font-weight:600; margin:6px 0 14px;">${window.escapeHtml(f.name)}</div>
     ${sheetRow('star', f.pinned?'Unpin':'Pin to top', 'act-pin')}
+    ${sheetRow('sparkle', 'Customize book cover', 'act-cover')}
     ${inRecents ? sheetRow('x', 'Remove from Continue reading', 'act-remove-recents') : (f.hideFromRecents ? sheetRow('rotate', 'Restore to Continue reading', 'act-add-recents') : '')}
     ${sheetRow('edit','Rename','act-rename')}
     ${sheetRow('folder','Set folder / subject','act-folder')}
@@ -508,6 +495,13 @@ export function openBookMenu(fileId){
     window.Sheet.close();
     window.renderDashboard();
   };
+  if (document.getElementById('act-cover')) {
+    document.getElementById('act-cover').onclick = ()=>{
+      if (typeof window.openCoverCustomizer === 'function') {
+        window.openCoverCustomizer(f.id);
+      }
+    };
+  }
   if (document.getElementById('act-remove-recents')) {
     document.getElementById('act-remove-recents').onclick = async ()=>{
       f.hideFromRecents = true;
@@ -537,6 +531,9 @@ export function openBookMenu(fileId){
       const newName = document.getElementById('rename-input').value.trim() || f.name;
       f.name = newName;
       await window.DB.updateFileMeta(f.id, { name: newName });
+      if (typeof window.refreshSmartCoverIfActive === 'function') {
+        await window.refreshSmartCoverIfActive(f);
+      }
       window.Sheet.close();
       window.renderDashboard();
     };
@@ -677,6 +674,9 @@ export function openBookMenu(fileId){
       f.folder = folderInput.value.trim();
       f.subject = subjectInput.value.trim();
       await window.DB.updateFileMeta(f.id, { folder: f.folder, subject: f.subject });
+      if (typeof window.refreshSmartCoverIfActive === 'function') {
+        await window.refreshSmartCoverIfActive(f);
+      }
       window.Sheet.close();
       window.toast(f.folder ? `Moved to ${f.folder}` : 'Organization updated');
       window.renderDashboard();

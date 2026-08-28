@@ -1,5 +1,5 @@
 // S.A.Y.A.D. Service Worker for Offline Study & Native WebAPK Minting
-const CACHE_NAME = 'sayad-v21-bundled-pdfjs-fonts';
+const CACHE_NAME = 'sayad-v34-fix-range-indexsizeerror';
 const PRECACHE_URLS = [
   '/',
   '/index.html',

@@ -17,9 +17,9 @@ if (typeof window !== 'undefined' && window.pdfjsLib) {
 }
 
 export const PDFJS_LOAD_OPTS = {
-  cMapUrl: 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/cmaps/',
+  cMapUrl: '/pdfjs/cmaps/',
   cMapPacked: true,
-  standardFontDataUrl: 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/standard_fonts/',
+  standardFontDataUrl: '/pdfjs/standard_fonts/',
   disableFontFace: false,
   useSystemFonts: true,
   stopAtErrors: false,
@@ -29,7 +29,7 @@ window.PDFJS_LOAD_OPTS = PDFJS_LOAD_OPTS;
 
 /**
  * Multi-tier resilient PDF Document loader.
- * Gracefully tries primary CDN, fallback CDN, and direct parsing with FULL embedded font rendering.
+ * Gracefully tries primary Local bundle, CDN fallbacks, and direct parsing with FULL embedded font rendering.
  */
 export async function loadPdfDocumentSafely(rawBuffer, password = null) {
   if (!rawBuffer || rawBuffer.byteLength === 0) {
@@ -41,13 +41,13 @@ export async function loadPdfDocumentSafely(rawBuffer, password = null) {
     window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
   }
 
-  // Tier 1: Primary CMap & Font configuration with full font rendering (cdnjs)
+  // Tier 1: Local Bundled CMaps & Standard Fonts (Zero network dependency, instant offline reliability)
   try {
     const opts1 = {
       data: new Uint8Array(rawBuffer.slice(0)),
-      cMapUrl: 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/cmaps/',
+      cMapUrl: '/pdfjs/cmaps/',
       cMapPacked: true,
-      standardFontDataUrl: 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/standard_fonts/',
+      standardFontDataUrl: '/pdfjs/standard_fonts/',
       disableFontFace: false,
       useSystemFonts: true,
       stopAtErrors: false,
@@ -60,7 +60,7 @@ export async function loadPdfDocumentSafely(rawBuffer, password = null) {
     if (err1 && (err1.name === 'PasswordException' || err1.message?.toLowerCase().includes('password'))) {
       throw err1;
     }
-    console.warn('[PDF Loader] Tier 1 failed, trying Tier 2 (unpkg fallback CDN)...', err1?.message);
+    console.warn('[PDF Loader] Tier 1 (Local Fonts/CMaps) failed, trying Tier 2 (cdnjs CDN)...', err1?.message);
   }
 
   // Tier 2: Fallback unpkg CDN with lenient error recovery
@@ -82,7 +82,29 @@ export async function loadPdfDocumentSafely(rawBuffer, password = null) {
     if (err2 && (err2.name === 'PasswordException' || err2.message?.toLowerCase().includes('password'))) {
       throw err2;
     }
-    console.warn('[PDF Loader] Tier 2 failed, trying Tier 3 (Direct Byte Buffer with Fonts)...', err2?.message);
+    console.warn('[PDF Loader] Tier 2 failed, trying Tier 2.5 (jsdelivr fallback CDN with Fonts)...', err2?.message);
+  }
+
+  // Tier 2.5: High-speed jsDelivr CDN fallback with full CMaps and Standard Fonts
+  try {
+    const opts2b = {
+      data: new Uint8Array(rawBuffer.slice(0)),
+      cMapUrl: 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/cmaps/',
+      cMapPacked: true,
+      standardFontDataUrl: 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/standard_fonts/',
+      disableFontFace: false,
+      useSystemFonts: true,
+      stopAtErrors: false,
+      verbosity: 0,
+    };
+    if (password) opts2b.password = password;
+    const task = window.pdfjsLib.getDocument(opts2b);
+    return await task.promise;
+  } catch (err2b) {
+    if (err2b && (err2b.name === 'PasswordException' || err2b.message?.toLowerCase().includes('password'))) {
+      throw err2b;
+    }
+    console.warn('[PDF Loader] Tier 2.5 failed, trying Tier 3 (Direct Byte Buffer)...', err2b?.message);
   }
 
   // Tier 3: Direct TypedArray parser with standard font-face enabled
@@ -2823,8 +2845,8 @@ export async function renderPage(num){
     const page = await window.State.currentDoc.getPage(num);
     const viewport = page.getViewport({scale: pe.scale});
     
-    // Memory-safe sharp rendering via clamped DPR viewport scaling
-    const dpr = Math.min(window.devicePixelRatio || 1.5, 2.2);
+    // Ultra-sharp crystal-clear rendering (Google Drive grade sharpness & pinch-zoom clarity)
+    const dpr = Math.min((window.devicePixelRatio || 2) * 1.6, 4);
     const renderViewport = page.getViewport({ scale: pe.scale * dpr });
 
     const canvas = document.createElement('canvas');

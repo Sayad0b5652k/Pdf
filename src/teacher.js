@@ -385,9 +385,8 @@ export async function getTeacherContext(options = {}, userQuery = '', chatHistor
     || cleanQ.match(/\b(\d+\.\d+)\b/);
   const targetIntextNum = intextMatch && intextMatch[1] ? intextMatch[1] : '';
 
-  // Detect if current query is a Follow-Up query to the previous conversation
-  const isPureFollowUp = /^(?:isse|isko|iska|isme|is\s+topic|is\s+page|yeh|ye|this|that|it|aur|more|continue|further)\b/i.test(cleanQ)
-    || /(?:isse\s+related|aur\s+batao|aur\s+samjhao|aur\s+detail|aur\s+info|explain\s+more|continue\s+this|what\s+else|give\s+examples?|formula\s+batao|practice\s+questions?)/i.test(cleanQ);
+  // Detect last discussed page from conversation history for natural continuity
+  const lastDiscussedPage = detectLastDiscussedPage(chatHistory, null);
 
   let anchorPage = currentReaderPage;
 
@@ -396,11 +395,9 @@ export async function getTeacherContext(options = {}, userQuery = '', chatHistor
     if (pReq >= 1 && pReq <= totalPages) {
       anchorPage = pReq;
     }
-  } else if (isPureFollowUp) {
-    const lastDiscussed = detectLastDiscussedPage(chatHistory, null);
-    if (lastDiscussed && lastDiscussed >= 1 && lastDiscussed <= totalPages) {
-      anchorPage = lastDiscussed;
-    }
+  } else if (lastDiscussedPage && lastDiscussedPage >= 1 && lastDiscussedPage <= totalPages) {
+    // If user has an active chat history, maintain continuity with the discussed topic/page
+    anchorPage = lastDiscussedPage;
   }
 
   // Page Text map: pageNum -> { text, label }
@@ -472,12 +469,12 @@ export async function getTeacherContext(options = {}, userQuery = '', chatHistor
         }
 
         // 3. EXACT MULTI-WORD PHRASE MATCH
-        if (cleanQ.length > 5 && !isPureFollowUp && lowerTxt.includes(cleanQ)) {
+        if (cleanQ.length > 5 && lowerTxt.includes(cleanQ)) {
           score += 500;
         }
 
         // 4. KEYWORD TOKEN MATCHING
-        if (queryTokens.length > 0 && !isPureFollowUp) {
+        if (queryTokens.length > 0) {
           let tokenMatches = 0;
           for (const token of queryTokens) {
             if (lowerTxt.includes(token)) {
@@ -519,6 +516,14 @@ export async function getTeacherContext(options = {}, userQuery = '', chatHistor
           }
         }
       }
+    }
+  }
+
+  // Ensure last discussed page from active conversation is also seeded into context if different
+  if (doc && lastDiscussedPage && lastDiscussedPage >= 1 && lastDiscussedPage <= totalPages && !matchedPagesMap.has(lastDiscussedPage)) {
+    const prevTxt = await getPdfPageText(doc, lastDiscussedPage, activeFileId);
+    if (prevTxt && prevTxt.trim()) {
+      matchedPagesMap.set(lastDiscussedPage, { text: prevTxt, label: '💬 PREVIOUSLY DISCUSSED TOPIC PAGE' });
     }
   }
 
@@ -758,17 +763,23 @@ export function openTeacherView(prefillQuery = '', defaultMode = 'professional',
       
       <!-- Quick Prompt Suggestion Chips -->
       <div id="chat-quick-chips-bar" style="display:flex; align-items:center; gap:6px; overflow-x:auto; padding-bottom:6px; scrollbar-width:none; -webkit-overflow-scrolling:touch;">
-        <button class="chat-quick-chip" data-query="Summarize the core concepts of this page step-by-step with key takeaways">
-          <span>⚡ Summarize Page</span>
+        <button class="chat-quick-chip" data-query="⚡ Detail me samjhao — key concepts, causes, aur deep breakdown ke saath">
+          <span>⚡ Detail me samjhao</span>
         </button>
-        <button class="chat-quick-chip" data-query="What are the top 2, 3 and 5 mark exam questions from this page with scoring points?">
-          <span>🎯 Exam Questions</span>
+        <button class="chat-quick-chip" data-query="Draw a clear Mermaid flowchart diagram explaining this process step-by-step">
+          <span>📊 Flowchart</span>
         </button>
-        <button class="chat-quick-chip" data-query="Explain this topic with a super simple real-world analogy and zero jargon">
+        <button class="chat-quick-chip" data-query="💡 Is concept ko simple real-world analogy se samjhao (zero jargon)">
           <span>💡 Simple Analogy</span>
         </button>
-        <button class="chat-quick-chip" data-query="Give me a catchy mnemonic memory trick and formulas cheat sheet for this topic">
-          <span>🧠 Memory Hacks</span>
+        <button class="chat-quick-chip" data-query="🎯 Exam ke point of view se important questions, keywords aur scoring points batao">
+          <span>🎯 Exam Points</span>
+        </button>
+        <button class="chat-quick-chip" data-query="🗺️ Is topic ka authentic educational map dikhao">
+          <span>🗺️ Map dikhao</span>
+        </button>
+        <button class="chat-quick-chip" data-query="🖼️ Is concept ka labeled diagram ya authentic visual illustration dikhao">
+          <span>🖼️ Visual / Diagram</span>
         </button>
       </div>
 
@@ -821,6 +832,7 @@ export async function initTeacherViewLogic(fileId, prefillQuery) {
   const isGlobal = fileId === 'global_chat' || !currentFile;
   const docTitle = isGlobal ? 'Library Universal Chat' : (currentFile ? currentFile.name : 'Document');
   const currentPage = (!isGlobal && window.State?.currentPage) ? window.State.currentPage : 1;
+  let activeAiEngine = (typeof localStorage !== 'undefined' ? localStorage.getItem('sayad_preferred_ai_engine') : '') || 'auto';
 
   function renderMessages() {
     if (!chatLogEl) return;
@@ -949,12 +961,82 @@ export async function initTeacherViewLogic(fileId, prefillQuery) {
           renderMessages();
           window.toast('Message deleted 🗑️');
         } else if (action === 'speak') {
-          btn.innerHTML = `${window.icon('volume','icon icon-xs')} <span>Speaking…</span>`;
-          await speakWithElevenLabs(msg.text, {
-            onEnd: () => {
-              btn.innerHTML = `${window.icon('volume','icon icon-xs')} <span>Listen</span>`;
+          // If currently speaking, stop
+          if (window._activeTeacherSpeech) {
+            try {
+              if (window.speechSynthesis) window.speechSynthesis.cancel();
+              if (typeof stopElevenAudio === 'function') stopElevenAudio();
+            } catch(e) {}
+            window._activeTeacherSpeech = null;
+            btn.innerHTML = `${window.icon('volume','icon icon-xs')} <span>Listen</span>`;
+            window.toast('Audio stopped ⏹️');
+            return;
+          }
+
+          // Strip markdown symbols and code blocks for clean TTS speech
+          const cleanSpeechText = (msg.text || '')
+            .replace(/```mermaid[\s\S]*?```/gi, ' [Flowchart Diagram] ')
+            .replace(/```[\s\S]*?```/g, '')
+            .replace(/!\[.*?\]\(.*?\)/g, '')
+            .replace(/[#*_`~>-]/g, ' ')
+            .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+            .replace(/\s+/g, ' ')
+            .trim();
+
+          if (!cleanSpeechText) {
+            window.toast('No spoken text in this message');
+            return;
+          }
+
+          btn.innerHTML = `<span style="display:inline-block; animation:pulse 1s infinite;">🔊</span> <span>Stop</span>`;
+          window._activeTeacherSpeech = btn;
+
+          const resetBtn = () => {
+            btn.innerHTML = `${window.icon('volume','icon icon-xs')} <span>Listen</span>`;
+            window._activeTeacherSpeech = null;
+          };
+
+          const fallbackWebSpeech = () => {
+            if (!('speechSynthesis' in window)) {
+              resetBtn();
+              window.toast('Speech audio is not supported in this browser.');
+              return;
             }
-          });
+            try {
+              window.speechSynthesis.cancel();
+              const utterance = new SpeechSynthesisUtterance(cleanSpeechText.slice(0, 2500));
+              utterance.rate = 1.0;
+              const voices = window.speechSynthesis.getVoices();
+              const isHindiOrHinglish = /[\u0900-\u097F]/.test(cleanSpeechText) || /\b(?:hai|aur|kya|ye|yeh|samjhao|batao|kaise)\b/i.test(cleanSpeechText);
+              if (isHindiOrHinglish) {
+                const hiVoice = voices.find(v => v.lang.includes('hi') || v.lang.includes('IN'));
+                if (hiVoice) utterance.voice = hiVoice;
+              } else {
+                const enVoice = voices.find(v => v.lang.includes('en') && (v.name.includes('Natural') || v.name.includes('Google') || v.name.includes('Neural')));
+                if (enVoice) utterance.voice = enVoice;
+              }
+              utterance.onend = resetBtn;
+              utterance.onerror = resetBtn;
+              window.speechSynthesis.speak(utterance);
+            } catch(e) {
+              resetBtn();
+            }
+          };
+
+          // Try ElevenLabs first if key is configured, otherwise immediate Web Speech
+          const hasElevenKey = (typeof localStorage !== 'undefined' && localStorage.getItem('sayad_eleven_labs_key'));
+          if (hasElevenKey && typeof speakWithElevenLabs === 'function') {
+            try {
+              await speakWithElevenLabs(cleanSpeechText.slice(0, 1000), {
+                onEnd: resetBtn,
+                onError: fallbackWebSpeech
+              });
+            } catch(e) {
+              fallbackWebSpeech();
+            }
+          } else {
+            fallbackWebSpeech();
+          }
         } else if (action === 'copy') {
           const ok = await window.copyToClipboard(msg.text);
           window.toast(ok ? 'Copied explanation to clipboard' : 'Could not copy');
@@ -1019,6 +1101,30 @@ export async function initTeacherViewLogic(fileId, prefillQuery) {
         }
       };
     });
+
+    if (typeof window.renderMermaidDiagrams === 'function') {
+      setTimeout(() => {
+        window.renderMermaidDiagrams(chatLogEl);
+      }, 60);
+    }
+
+    if (typeof window.renderMathFormulas === 'function') {
+      setTimeout(() => {
+        window.renderMathFormulas(chatLogEl);
+      }, 70);
+    } else if (typeof window.renderMathInElement === 'function') {
+      setTimeout(() => {
+        window.renderMathInElement(chatLogEl, {
+          delimiters: [
+            { left: '$$', right: '$$', display: true },
+            { left: '$', right: '$', display: false },
+            { left: '\\(', right: '\\)', display: false },
+            { left: '\\[', right: '\\]', display: true }
+          ],
+          throwOnError: false
+        });
+      }, 70);
+    }
   }
 
   renderMessages();
@@ -1035,6 +1141,36 @@ export async function initTeacherViewLogic(fileId, prefillQuery) {
           <button id="close-custom-sheet" class="btn btn-icon" style="width:32px; height:32px; border-radius:50%; flex-shrink:0;">
             ${window.icon('x','icon icon-sm')}
           </button>
+        </div>
+
+        <!-- AI Inference Engine / Model Selector -->
+        <div style="margin-bottom:16px;">
+          <label style="font-size:12px; font-weight:700; color:var(--text-dim); display:block; margin-bottom:8px; text-transform:uppercase; letter-spacing:0.04em;">AI Model Engine</label>
+          <div style="display:grid; grid-template-columns:1fr; gap:8px;">
+            <button class="btn custom-engine-opt ${activeAiEngine === 'auto' ? 'active' : ''}" data-engine="auto" style="display:flex; align-items:center; justify-content:space-between; padding:10px 12px; border-radius:10px; background:${activeAiEngine === 'auto' ? 'var(--accent-soft)' : 'var(--surface-2)'}; border:1.5px solid ${activeAiEngine === 'auto' ? 'var(--accent)' : 'var(--border)'};">
+              <div style="text-align:left;">
+                <div style="font-size:13px; font-weight:700; color:${activeAiEngine === 'auto' ? 'var(--accent)' : 'var(--text)'};">⚡ Auto-Switch (Gemini Flash + OpenRouter)</div>
+                <div style="font-size:11px; color:var(--text-dim);">High-speed AI reasoning with instantaneous DeepSeek/LLaMA fallback</div>
+              </div>
+              ${activeAiEngine === 'auto' ? '<span style="color:var(--accent); font-weight:700;">✓</span>' : ''}
+            </button>
+
+            <button class="btn custom-engine-opt ${activeAiEngine === 'deepseek' ? 'active' : ''}" data-engine="deepseek" style="display:flex; align-items:center; justify-content:space-between; padding:10px 12px; border-radius:10px; background:${activeAiEngine === 'deepseek' ? 'var(--accent-soft)' : 'var(--surface-2)'}; border:1.5px solid ${activeAiEngine === 'deepseek' ? 'var(--accent)' : 'var(--border)'};">
+              <div style="text-align:left;">
+                <div style="font-size:13px; font-weight:700; color:${activeAiEngine === 'deepseek' ? 'var(--accent)' : 'var(--text)'};">🧠 DeepSeek V3 (via OpenRouter)</div>
+                <div style="font-size:11px; color:var(--text-dim);">Exceptional complex reasoning, multi-turn dialogue &amp; math derivation</div>
+              </div>
+              ${activeAiEngine === 'deepseek' ? '<span style="color:var(--accent); font-weight:700;">✓</span>' : ''}
+            </button>
+
+            <button class="btn custom-engine-opt ${activeAiEngine === 'llama' ? 'active' : ''}" data-engine="llama" style="display:flex; align-items:center; justify-content:space-between; padding:10px 12px; border-radius:10px; background:${activeAiEngine === 'llama' ? 'var(--accent-soft)' : 'var(--surface-2)'}; border:1.5px solid ${activeAiEngine === 'llama' ? 'var(--accent)' : 'var(--border)'};">
+              <div style="text-align:left;">
+                <div style="font-size:13px; font-weight:700; color:${activeAiEngine === 'llama' ? 'var(--accent)' : 'var(--text)'};">🦙 Meta LLaMA 3.3 70B (via OpenRouter)</div>
+                <div style="font-size:11px; color:var(--text-dim);">Authoritative open-weights model for academic knowledge &amp; textbook Q&amp;A</div>
+              </div>
+              ${activeAiEngine === 'llama' ? '<span style="color:var(--accent); font-weight:700;">✓</span>' : ''}
+            </button>
+          </div>
         </div>
 
         <!-- Teaching Personas -->
@@ -1144,11 +1280,123 @@ export async function initTeacherViewLogic(fileId, prefillQuery) {
         window.toast(`Rubric set to ${examTargetMarks} Marks`);
       };
     });
+
+    document.querySelectorAll('.custom-engine-opt').forEach(btn => {
+      btn.onclick = () => {
+        activeAiEngine = btn.dataset.engine;
+        if (typeof localStorage !== 'undefined') {
+          localStorage.setItem('sayad_preferred_ai_engine', activeAiEngine);
+        }
+        document.querySelectorAll('.custom-engine-opt').forEach(b => {
+          const isAct = b.dataset.engine === activeAiEngine;
+          b.style.background = isAct ? 'var(--accent-soft)' : 'var(--surface-2)';
+          b.style.borderColor = isAct ? 'var(--accent)' : 'var(--border)';
+          const checkSpan = b.querySelector('span');
+          if (isAct) {
+            if (!checkSpan) {
+              const sp = document.createElement('span');
+              sp.style.cssText = 'color:var(--accent); font-weight:700;';
+              sp.textContent = '✓';
+              b.appendChild(sp);
+            }
+          } else {
+            if (checkSpan) checkSpan.remove();
+          }
+        });
+        const name = btn.querySelector('div > div')?.textContent || activeAiEngine;
+        window.toast(`Engine: ${name.split('(')[0].trim()}`);
+      };
+    });
   };
 
   if (customToggle) customToggle.onclick = openCustomizationSheet;
 
-  // Quick Suggestion Chips Click
+  // Dynamic Suggestion Chips Updater
+  let lastKnownSubject = '';
+
+  const cleanSubjectForChips = (raw) => {
+    if (!raw) return '';
+    let s = raw
+      .replace(/```[\s\S]*?```/g, ' ')
+      .replace(/[?!.,;:"'()[\]{}]/g, ' ')
+      .replace(/\b(?:acha|achha|accha|theek\s+hai|thik\s+hai|ok|okay|ab|fir|phir|aur|sun|suno|bhai|yaar|dost|arrey|are|sir|mam|madam|please|kripya|zara|ek\s+baar|thoda|thode|kuch|koi|bhi|toh|to|chalo|well|now|then|so)\b/gi, ' ')
+      .replace(/\b(?:mujhe|kripya|please|can\s+you|banao|dikhao|dikaho|dikha|dikho|dikhdo|dikhadena|dikahao|dikhye|dikhaye|dikhana|dekhao|deko|dekho|dekhna|dikhwao|do|dena|show\s+me|show|generate|give\s+me|give|create|fetch|send|bhejo|image\s+of|photo\s+of|picture\s+of|diagram\s+of|map\s+of|portrait\s+of|potrait\s+of|ka|ki|ke|ko|se|me|mein|par|pe|ek|a|an|the|ya|or|chahiye|dekhna|potrait|portrait|portait|portret|tasveer|tasvir|chitra|naksha|photo|photos|foto|fotos|pic|pics|picture|pictures|image|images|imag|imge|img|imgs|imeg|imaj|flowchart|flow\s+chart|diagram|diagrams|draw|drawing|zariye|madhyam|samjhao|samjha|batao|explain|detail\s+me|kyu|kyun|kya|hai|hain|tha|the)\b/gi, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    if (/\b(?:modi|narendra\s+modi)\b/i.test(s)) return 'Narendra Modi';
+    if (/\b(?:ramanujan|srinivasa)\b/i.test(s)) return 'Srinivasa Ramanujan';
+    if (/\b(?:kalam|abdul\s+kalam)\b/i.test(s)) return 'A. P. J. Abdul Kalam';
+    if (/\b(?:aryabhata|aryabhatta)\b/i.test(s)) return 'Aryabhata';
+    if (/\b(?:shivaji)\b/i.test(s)) return 'Shivaji Maharaj';
+    if (/\b(?:hitler|adolf)\b/i.test(s)) return 'Adolf Hitler';
+    if (/\b(?:curie|marie)\b/i.test(s)) return 'Marie Curie';
+    if (/\b(?:einstein|albert)\b/i.test(s)) return 'Albert Einstein';
+    if (/\b(?:newton|isaac)\b/i.test(s)) return 'Isaac Newton';
+    if (/\b(?:darwin|charles)\b/i.test(s)) return 'Charles Darwin';
+    if (/\b(?:galileo)\b/i.test(s)) return 'Galileo Galilei';
+    if (/\b(?:tesla|nikola)\b/i.test(s)) return 'Nikola Tesla';
+    if (/\b(?:gandhi|mahatma)\b/i.test(s)) return 'Mahatma Gandhi';
+    if (/\b(?:bose|subhas|subhash)\b/i.test(s)) return 'Subhash Chandra Bose';
+    if (/\b(?:nehru|jawaharlal)\b/i.test(s)) return 'Jawaharlal Nehru';
+    if (/\b(?:ambedkar)\b/i.test(s)) return 'B. R. Ambedkar';
+    if (/\b(?:bhagat\s+singh)\b/i.test(s)) return 'Bhagat Singh';
+
+    const hasPronoun = /\b(?:unka|unke|unki|unko|unhe|inka|inke|inki|inko|inhe|iska|iske|iski|isko|uska|uske|uski|usko|ye|yeh|wo|woh|he|she|they|his|her)\b/i.test(s);
+    if (hasPronoun || s.length < 2) return '';
+    return s.slice(0, 26);
+  };
+
+  function updateDynamicQuickChips(detectedTopic) {
+    const bar = document.getElementById('chat-quick-chips-bar');
+    if (!bar) return;
+
+    let cleanTopic = cleanSubjectForChips(detectedTopic);
+
+    if (cleanTopic && cleanTopic.length >= 2) {
+      lastKnownSubject = cleanTopic;
+    } else if (lastKnownSubject) {
+      cleanTopic = lastKnownSubject;
+    }
+
+    let chips = [];
+    if (cleanTopic && cleanTopic.length >= 2) {
+      const shortTitle = cleanTopic.slice(0, 20);
+      chips = [
+        { label: `📊 ${shortTitle} Flowchart`, query: `Draw an interactive Mermaid flowchart showing the timeline, key stages, and core components of ${cleanTopic}` },
+        { label: `⚡ ${shortTitle} Detail Breakdown`, query: `Detail me samjhao ${cleanTopic} ke core concepts, causes aur deep points` },
+        { label: `💡 Simple Analogy`, query: `Is concept (${cleanTopic}) ko everyday real-world analogy se simple terms me samjhao` },
+        { label: `🖼️ Visual / Diagram`, query: `${cleanTopic} ka authentic educational visual illustration ya diagram dikhao` },
+        { label: `🎯 Exam Points`, query: `Exam ke point of view se ${cleanTopic} par high-yield questions aur scoring keywords batao` }
+      ];
+    } else {
+      chips = [
+        { label: '⚡ Detail me samjhao', query: '⚡ Detail me samjhao — key concepts, causes, aur deep breakdown ke saath' },
+        { label: '📊 Flowchart', query: 'Draw a clear Mermaid flowchart diagram explaining this process step-by-step' },
+        { label: '💡 Simple Analogy', query: '💡 Is concept ko simple real-world analogy se samjhao (zero jargon)' },
+        { label: '🎯 Exam Points', query: '🎯 Exam ke point of view se important questions, keywords aur scoring points batao' },
+        { label: '🖼️ Visual / Diagram', query: '🖼️ Is concept ka labeled diagram ya authentic visual illustration dikhao' }
+      ];
+    }
+
+    bar.innerHTML = chips.map(c => `
+      <button class="chat-quick-chip" data-query="${window.escapeHtml(c.query)}" style="white-space:nowrap; flex-shrink:0;">
+        <span>${c.label}</span>
+      </button>
+    `).join('');
+
+    bar.querySelectorAll('.chat-quick-chip').forEach(chip => {
+      chip.onclick = () => {
+        const q = chip.dataset.query;
+        if (q && inputEl) {
+          inputEl.value = q;
+          sendUserMessage();
+        }
+      };
+    });
+  }
+
+  // Quick Suggestion Chips Initial Click Binding
   document.querySelectorAll('.chat-quick-chip').forEach(chip => {
     chip.onclick = () => {
       const q = chip.dataset.query;
@@ -1337,7 +1585,7 @@ export async function initTeacherViewLogic(fileId, prefillQuery) {
       } else if (activeTeacherMode === 'evaluator') {
         systemPersonaInstruction = `Evaluate according to standard exam marking rubrics (${examTargetMarks} Marks Target), highlighting scoring keywords.`;
       } else {
-        systemPersonaInstruction = 'Act as an intelligent, articulate, and friendly AI study tutor.';
+        systemPersonaInstruction = 'You are an elite AI Super-Intelligence operating with the exact conversational mastery of ChatGPT (GPT-4o) and Claude (Sonnet 3.5). Direct, sharp, natural, and intellectually deep. NEVER greet or give canned introductory phrases. Jump immediately into the core substance.';
       }
 
       const recentConvo = chatMessages.slice(-6, -1).map(m => `${m.role === 'user' ? 'Student' : 'AI Tutor'}: ${m.text}`).join('\n\n');
@@ -1357,8 +1605,9 @@ export async function initTeacherViewLogic(fileId, prefillQuery) {
             fullContext: ctx.chapterText || ctx.pageText || ctx.bookOverviewText,
             persona: systemPersonaInstruction,
             language: 'English/Hinglish (matching the student natural inquiry)',
-            chatHistory: chatMessages.slice(-10, -2).filter(m => m.text && m.text !== '…').map(m => ({ role: m.role, text: m.text })),
-            customKey: customKey || undefined
+            chatHistory: chatMessages.slice(-14, -2).filter(m => m.text && m.text !== '…').map(m => ({ role: m.role, text: m.text })),
+            customKey: customKey || undefined,
+            preferredEngine: activeAiEngine || 'auto'
           })
         });
 
@@ -1398,7 +1647,7 @@ Provide the complete academic answer now:`;
 
           const fetchAi = (typeof callServerGemini === 'function' ? callServerGemini : window.callServerGemini) || callAI || window.callAI;
           if (typeof fetchAi === 'function') {
-            replyText = await fetchAi(fullPrompt, systemPersonaInstruction, 'gemini-3.7-flash');
+            replyText = await fetchAi(fullPrompt, systemPersonaInstruction, 'gemini-3.1-flash-lite');
           }
         } catch (fetchErr) {
           console.warn('Direct AI fallback warning:', fetchErr);
@@ -1429,6 +1678,12 @@ Provide the complete academic answer now:`;
 
     sendBtn.disabled = false;
     renderMessages();
+
+    // Dynamically refresh quick chips with contextually relevant follow-up suggestions
+    try {
+      const candidateTopic = cleanSubjectForChips(userText) || lastKnownSubject;
+      if (candidateTopic) updateDynamicQuickChips(candidateTopic);
+    } catch(e) {}
   }
 
   // Bind Send & Input events

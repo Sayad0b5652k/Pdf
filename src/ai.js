@@ -91,11 +91,11 @@ export async function callOpenRouter(prompt, model = 'meta-llama/llama-3.3-70b-i
 }
 
 export async function callGeminiFast(prompt, systemInstruction = '') {
-  return await callServerGemini(prompt, systemInstruction, 'gemini-3.7-flash');
+  return await callServerGemini(prompt, systemInstruction, 'gemini-3.1-flash-lite');
 }
 
 export async function callGemini(prompt, systemInstruction = ''){
-  return await callServerGemini(prompt, systemInstruction, 'gemini-3.7-flash');
+  return await callServerGemini(prompt, systemInstruction, 'gemini-3.1-flash-lite');
 }
 
 export async function callGroq(prompt){

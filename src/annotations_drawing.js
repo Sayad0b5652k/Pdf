@@ -332,11 +332,20 @@ function getFabricPointer(fCanvas, options) {
 }
 
 async function safeLoadFromJSON(fCanvas, json, callback) {
-  if (!fCanvas || !json) return;
+  if (!fCanvas || !json) {
+    if (callback) callback();
+    return;
+  }
   try {
     const parsed = typeof json === 'string' ? JSON.parse(json) : json;
     if (parsed && typeof parsed === 'object') {
       delete parsed.viewportTransform;
+    }
+
+    // Verify contextContainer exists to prevent clearRect crash on unattached canvas
+    if (!fCanvas.contextContainer && !fCanvas.getContext) {
+      if (callback) callback();
+      return;
     }
 
     let called = false;
@@ -352,7 +361,8 @@ async function safeLoadFromJSON(fCanvas, json, callback) {
       done();
     }
   } catch (err) {
-    console.error('Error loading JSON in Fabric:', err);
+    console.warn('Error loading JSON in Fabric:', err);
+    if (callback) callback();
   }
 }
 
@@ -881,38 +891,52 @@ async function savePageCanvasState(pageNum) {
 }
 
 export async function paintDrawingsForPage(pageNum) {
-  const fCanvas = ensurePageDrawLayer(pageNum);
-  if (!fCanvas || !window.State || !window.State.currentFile) return;
-
-  const pe = window.pageEls ? window.pageEls[pageNum] : null;
-  const currentScale = pe?.scale || 1.0;
-
-  let annots = [];
   try {
-    annots = await window.DB.byIndex('annotations', 'fileId', window.State.currentFile.id);
-  } catch (err) {
-    console.error('Error fetching annotations:', err);
-    return;
-  }
+    const fCanvas = ensurePageDrawLayer(pageNum);
+    if (!fCanvas || !window.State || !window.State.currentFile) return;
 
-  const drawingRecord = annots.find(a => a.page === pageNum && a.kind === 'drawing' && a.json);
+    const pe = window.pageEls ? window.pageEls[pageNum] : null;
+    const currentScale = pe?.scale || 1.0;
 
-  if (drawingRecord && drawingRecord.json) {
-    await safeLoadFromJSON(fCanvas, drawingRecord.json, () => {
-      fCanvas.setZoom(currentScale);
-      applyToolToFabricCanvas(fCanvas, pageNum);
-      fCanvas.requestRenderAll();
+    let annots = [];
+    try {
+      annots = await window.DB.byIndex('annotations', 'fileId', window.State.currentFile.id);
+    } catch (err) {
+      console.warn('Error fetching annotations:', err);
+      return;
+    }
 
-      let stack = undoStacks.get(pageNum) || [];
-      if (stack.length === 0) {
-        stack.push(drawingRecord.json);
-        undoStacks.set(pageNum, stack);
+    const drawingRecord = annots.find(a => a.page === pageNum && a.kind === 'drawing' && a.json);
+
+    if (drawingRecord && drawingRecord.json) {
+      await safeLoadFromJSON(fCanvas, drawingRecord.json, () => {
+        try {
+          if (fCanvas && typeof fCanvas.setZoom === 'function') fCanvas.setZoom(currentScale);
+          applyToolToFabricCanvas(fCanvas, pageNum);
+          if (fCanvas && typeof fCanvas.requestRenderAll === 'function') fCanvas.requestRenderAll();
+
+          let stack = undoStacks.get(pageNum) || [];
+          if (stack.length === 0) {
+            stack.push(drawingRecord.json);
+            undoStacks.set(pageNum, stack);
+          }
+        } catch (applyErr) {
+          console.warn('Drawing apply notice:', applyErr);
+        }
+      });
+    } else {
+      try {
+        if (fCanvas && typeof fCanvas.clear === 'function' && (fCanvas.contextContainer || fCanvas.getContext)) {
+          fCanvas.clear();
+        }
+        if (fCanvas && typeof fCanvas.setZoom === 'function') fCanvas.setZoom(currentScale);
+        applyToolToFabricCanvas(fCanvas, pageNum);
+      } catch (clearErr) {
+        console.warn('Notice clearing fabric canvas on page', pageNum, clearErr);
       }
-    });
-  } else {
-    fCanvas.clear();
-    fCanvas.setZoom(currentScale);
-    applyToolToFabricCanvas(fCanvas, pageNum);
+    }
+  } catch (err) {
+    console.warn('Notice in paintDrawingsForPage on page', pageNum, err);
   }
 }
 

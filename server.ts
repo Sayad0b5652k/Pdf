@@ -212,6 +212,19 @@ class GeminiKeyPool {
 
 const keyPool = new GeminiKeyPool();
 
+// Track model-level temporary spikes (e.g. 503 High Demand / UNAVAILABLE)
+const modelOverloadCooldowns = new Map<string, number>();
+
+function isModelOverloaded(modelName: string): boolean {
+  const until = modelOverloadCooldowns.get(modelName) || 0;
+  return Date.now() < until;
+}
+
+function markModelOverloaded(modelName: string, durationMs = 120000) {
+  modelOverloadCooldowns.set(modelName, Date.now() + durationMs);
+  console.warn(`[GeminiKeyPool] Model [${modelName}] marked on temporary high-demand cooldown for ${durationMs / 1000}s`);
+}
+
 // Execute Gemini prompt across the key pool with powerful models
 async function executeWithGeminiPool(
   category: 'study' | 'chat' | 'general',
@@ -222,6 +235,7 @@ async function executeWithGeminiPool(
     temperature?: number;
     responseMimeType?: string;
     customKey?: string;
+    tools?: any[];
   } = {}
 ): Promise<{ text: string; model: string; keyTag: string } | null> {
   // If user provided custom key (BYOK), prioritize it as top slot
@@ -236,14 +250,36 @@ async function executeWithGeminiPool(
   }
   if (!slots.length) return null;
 
-  // Ultra-fast, high-availability model queue:
-  // Primary: 'gemini-3.1-flash-lite' (high quota, ultra-low latency ~0.8s, immune to 503 demand spikes)
-  // Secondary: 'gemini-3.7-flash'
-  const modelQueue = Array.from(new Set([
-    options.targetModel || "gemini-3.1-flash-lite",
+  // Ultra-resilient, high-availability model queue using active canonical models:
+  // 1. gemini-3.1-flash-lite (fast, low latency, latest 3.x generation)
+  // 2. gemini-2.5-flash (super stable, massive quota, immune to 3.8 demand spikes)
+  // 3. gemini-3.8-flash (standard text model - safely placed behind 2.5-flash and filtered if 503 spike active)
+  let requested = options.targetModel;
+  if (!requested || requested.includes("2.0") || requested.includes("1.5")) {
+    requested = "gemini-3.1-flash-lite";
+  }
+
+  const candidateModels = [
+    requested,
     "gemini-3.1-flash-lite",
-    "gemini-3.7-flash",
-  ].filter(Boolean) as string[]));
+    "gemini-2.5-flash",
+    "gemini-3.8-flash",
+  ];
+
+  const healthyModels: string[] = [];
+  const overloadedModels: string[] = [];
+
+  for (const m of candidateModels) {
+    if (!m) continue;
+    if (m.includes("1.5") || m.includes("2.0")) continue;
+    if (isModelOverloaded(m)) {
+      overloadedModels.push(m);
+    } else {
+      healthyModels.push(m);
+    }
+  }
+
+  const modelQueue = Array.from(new Set([...healthyModels, ...overloadedModels]));
 
   const config: any = {
     temperature: typeof options.temperature === "number" ? options.temperature : 0.22,
@@ -255,29 +291,54 @@ async function executeWithGeminiPool(
   if (options.responseMimeType) {
     config.responseMimeType = options.responseMimeType;
   }
+  if (options.tools && Array.isArray(options.tools) && options.tools.length > 0) {
+    config.tools = options.tools;
+  }
 
   // Iterate over healthy slots
   for (const slot of slots) {
     const ai = keyPool.getClient(slot.key);
+    let anyModelSucceededOnSlot = false;
+
     for (const modelName of modelQueue) {
       try {
-        const timeoutMs = 30000;
+        const timeoutMs = 18000;
         const timeoutPromise = new Promise<{ text?: string; isTimeout: boolean }>((_, reject) =>
           setTimeout(() => reject(new Error(`Timeout ${timeoutMs}ms for ${modelName}`)), timeoutMs)
         );
 
         const generatePromise = (async () => {
-          const resp = await ai.models.generateContent({
-            model: modelName,
-            contents: prompt,
-            config,
-          });
-          return { text: resp.text, isTimeout: false };
+          try {
+            const resp = await ai.models.generateContent({
+              model: modelName,
+              contents: prompt,
+              config,
+            });
+            return { text: resp.text, isTimeout: false };
+          } catch (modelCallErr: any) {
+            // If tool call fails on a specific model, retry immediately without tools
+            if (config.tools) {
+              try {
+                const cleanCfg = { ...config };
+                delete cleanCfg.tools;
+                const resp2 = await ai.models.generateContent({
+                  model: modelName,
+                  contents: prompt,
+                  config: cleanCfg,
+                });
+                return { text: resp2.text, isTimeout: false };
+              } catch (retryErr) {
+                throw modelCallErr;
+              }
+            }
+            throw modelCallErr;
+          }
         })();
 
         const response: any = await Promise.race([generatePromise, timeoutPromise]);
         const text = response.text || "";
         if (text && text.trim()) {
+          anyModelSucceededOnSlot = true;
           return {
             text: text.trim(),
             model: modelName,
@@ -286,23 +347,42 @@ async function executeWithGeminiPool(
         }
       } catch (err: any) {
         const msg = err?.message || String(err);
-        console.log(`[Gemini Attempt Info] Key: [${slot.tag}] Model: [${modelName}] Note: ${msg.slice(0, 100)}`);
         
-        // 1. Quota exhaustion (429 / RESOURCE_EXHAUSTED) -> specific to key, cooldown key and switch to next slot
-        if (msg.includes("429") || msg.includes("RESOURCE_EXHAUSTED") || msg.includes("quota")) {
-          keyPool.markCooldown(slot.key, 60000);
-          break; // Switch to next key in pool
-        }
-        
-        // 2. High demand / temporary overload (503 / 500 / 504 / UNAVAILABLE) -> model-specific spike!
-        // Do NOT break out of the key loop; immediately proceed to next fallback model in queue (e.g. gemini-3.1-flash-lite)
-        if (msg.includes("503") || msg.includes("UNAVAILABLE") || msg.includes("high demand") || msg.includes("500") || msg.includes("504")) {
-          continue; // Try next model in modelQueue on same key
+        // If model is deprecated / 404 (e.g. no longer available), silently continue to next active model in queue
+        if (msg.includes("404") || msg.includes("no longer available") || msg.includes("not found")) {
+          continue;
         }
 
-        // 3. Timeout or other error -> try next model in queue
+        console.log(`[Gemini Attempt Info] Key: [${slot.tag}] Model: [${modelName}] Note: ${msg.slice(0, 100)}`);
+
+        // If the key itself is explicitly invalid or credential bad:
+        if (msg.includes("API_KEY_INVALID") || msg.includes("API key not valid") || msg.includes("CREDENTIAL_MISCONFIGURED")) {
+          keyPool.markCooldown(slot.key, 120000);
+          break; // Switch to next key
+        }
+        
+        // Quota exhaustion (429 / RESOURCE_EXHAUSTED):
+        // Note: Google Generative Language API quota is per-model.
+        // Try next fallback model in queue (e.g. gemini-2.5-flash) on this same key first!
+        if (msg.includes("429") || msg.includes("RESOURCE_EXHAUSTED") || msg.includes("quota")) {
+          continue; // Try next model in modelQueue on same key
+        }
+        
+        // High demand / temporary overload (503 / 500 / 504 / UNAVAILABLE) -> model-specific spike:
+        if (msg.includes("503") || msg.includes("UNAVAILABLE") || msg.includes("high demand") || msg.includes("500") || msg.includes("504")) {
+          // Immediately put this specific model on cooldown so other keys in pool don't hit the same 503 spike!
+          markModelOverloaded(modelName, 120000);
+          continue; // Try next model in modelQueue (e.g. gemini-2.5-flash)
+        }
+
+        // Timeout or other model error -> try next model in queue
         continue;
       }
+    }
+
+    // If all models in the queue failed on this slot, place key on short cooldown and try next key
+    if (!anyModelSucceededOnSlot) {
+      keyPool.markCooldown(slot.key, 30000);
     }
   }
   return null;
@@ -344,11 +424,23 @@ async function executeWithGroq(prompt: string, systemInstruction?: string, tempe
   return null;
 }
 
-async function executeWithOpenRouter(prompt: string, systemInstruction?: string, temperature = 0.3): Promise<string | null> {
+async function executeWithOpenRouter(
+  prompt: string,
+  systemInstruction?: string,
+  temperature = 0.3,
+  preferredModel?: string
+): Promise<{ text: string; model: string } | null> {
   const apiKey = process.env.OPENROUTER_API_KEY || process.env.OPENROUTER_AI;
   if (!apiKey) return null;
 
-  const models = ["meta-llama/llama-3.3-70b-instruct", "mistralai/mistral-small-24b-instruct-2501:free"];
+  const models = Array.from(new Set([
+    preferredModel,
+    "deepseek/deepseek-chat",
+    "meta-llama/llama-3.3-70b-instruct",
+    "qwen/qwen-2.5-72b-instruct",
+    "mistralai/mistral-small-24b-instruct-2501:free"
+  ].filter(Boolean) as string[]));
+
   for (const model of models) {
     try {
       const resp = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -372,11 +464,560 @@ async function executeWithOpenRouter(prompt: string, systemInstruction?: string,
       if (resp.ok) {
         const data: any = await resp.json();
         const text = data?.choices?.[0]?.message?.content;
-        if (text && text.trim()) return text.trim();
+        if (text && text.trim()) return { text: text.trim(), model };
       }
     } catch (err: any) {
       console.warn(`[OpenRouter Failover] Model ${model} error:`, err?.message);
     }
+  }
+  return null;
+}
+
+function detectUserLanguage(text: string): "Hinglish" | "Hindi" | "English" {
+  if (/[\u0900-\u097F]/.test(text)) return "Hindi";
+  const hinglishWords = /\b(?:kya|kyu|kyun|kaise|kaisa|kaisi|hai|hain|hoon|tha|thi|hoga|hogi|hoge|raha|rahe|rahi|aur|bhi|toh|ye|yeh|wo|woh|isko|usko|unka|unke|unki|inka|inke|apna|apni|meri|mera|mere|mujhe|tum|tumhe|aap|aapko|samjha|samjhao|batao|karo|karna|kar|krne|nahi|nhi|matlab|bhai|yaar|dekhna|dikhao|kripya|chahiye|mein|bataiye|kuch|sab|wale|wali|karein|samjho|theek|thik|accha|zariye)\b/i;
+  if (hinglishWords.test(text)) return "Hinglish";
+  return "English";
+}
+
+function isGreeting(q: string): boolean {
+  if (!q) return false;
+  const clean = q.trim().toLowerCase().replace(/[!?.,;:~`"']+/g, " ").replace(/\s+/g, " ").trim();
+  // If the query contains substantive academic question words or topics, not a pure greeting
+  if (/\b(?:why|what|how|explain|difference|formula|theory|chapter|page|equation|cause|effect|samjhao|batao|kya\s+hai|kyu\s+hai|kaise\s+hota|definition|meaning|flowchart|image|diagram|portrait|potrait|map|naksha|chitra)\b/i.test(clean)) {
+    return false;
+  }
+  // Check if it's composed purely of greeting / pleasantry tokens
+  const greetingTokens = /^(?:hi|hello|hey|heya|heyy|hola|namaste|namaskar|pranam|good\s+(?:morning|afternoon|evening)|yo|ram\s*ram)?\s*(?:kaise\s+ho|kaisa\s+hai|kaisi\s+ho|kya\s+haal\s+hai|kya\s+haal|kya\s+hal\s+hai|kya\s+chal\s+raha\s+hai|kya\s+chal\s+rha|sab\s+badhiya|sab\s+theek|whats\s*up|sup|wassup|how\s+are\s+you|how\s+r\s+u|aur\s+batao|aur\s+bhai)?\s*(?:bhai|bro|yaar|sir|mam|friend|dost|there|everyone)?$/i;
+  if (greetingTokens.test(clean) && clean.length > 0) return true;
+  if (/^(?:नमस्ते|प्रणाम|नमस्कार|कैसे हो|क्या हाल है|सब ठीक|कैसा है)$/.test(clean)) return true;
+  return false;
+}
+
+function isConversationalPleasantry(q: string): boolean {
+  if (!q) return false;
+  const clean = q.trim().toLowerCase().replace(/[!?.,;:~`"']+/g, " ").replace(/\s+/g, " ").trim();
+  return /^(?:ok|okay|theek\s+hai|thik\s+hai|accha|achha|achha\s+ji|theek|thik|samajh\s+gaya|samajh\s+gayi|got\s+it|shukriya|dhanyawad|thanks|thank\s+you|thanku|done|yes|haan|ha|sahi\s+hai|cool|awesome|great|nice|waah|wah|perfect)$/i.test(clean);
+}
+
+// Broadest possible Indian & Global pronoun / anaphora detection (Hinglish variants: unka, unnke, ye, yeh, yh, etc.)
+const anaphoricPronounsRegex = /\b(?:unka|unke|unki|unko|unhe|unhone|unse|unnka|unnke|unnki|unnko|unnhe|unnhone|unnse|inka|inke|inki|inko|inhe|inhone|inse|innka|innke|innki|innko|innhe|innhone|innse|uska|uske|uski|usko|usey|usne|usse|usska|usske|usski|ussko|ussey|ussne|ussse|iska|iske|iski|isko|isey|isne|isse|isska|isske|isski|issko|issey|issne|issse|ye|yeh|yh|yehi|yahi|wo|woh|voh|wohi|vahi|he|she|they|his|her|their|him|them|same|previous|pichla|pichle|pichli)\b/i;
+
+// Conversational pleasantries, prefixes and fillers that should NEVER pollute the academic topic query
+const conversationalPrefixRegex = /\b(?:acha|achha|accha|theek\s+hai|thik\s+hai|ok|okay|ab|fir|phir|aur|sun|suno|bhai|yaar|dost|arrey|are|sir|mam|madam|please|kripya|zara|ek\s+baar|thoda|thode|kuch|koi|bhi|toh|to|chalo|well|now|then|so)\b/gi;
+
+// Words that indicate an attribute of a person/topic, rather than an independent entity itself
+const attributeWordsRegex = /\b(?:life|jivan|jeevan|zindagi|biography|timeline|discoveries|inventions|history|works|theories|theory|story|kahani|kaam|process|mechanism|steps|details|points|contribution|contributions|achievements|career|shuruwat|bachpan|death|birth|kaise\s+hua|kya\s+tha|zariye|madhyam)\b/i;
+
+// Highly tolerant visual action and noun regex covering typical typos (imag, imge, dikho, dikaho, dikahao, etc.)
+const visualNoiseRegex = /\b(?:mujhe|kripya|please|can\s+you|banao|dikhao|dikaho|dikha|dikho|dikhdo|dikhadena|dikahao|dikhye|dikhaye|dikhana|dekhao|deko|dekho|dekhna|dikhwao|dikhaw|dikhlao|dikhlana|dikhva|dikhwa|do|dena|show\s+me|show|generate|give\s+me|give|create|fetch|send|bhejo|image\s+of|photo\s+of|picture\s+of|diagram\s+of|map\s+of|portrait\s+of|potrait\s+of|authentic|labeled|scientific|historical|geographical|ka|ki|ke|ko|se|me|mein|par|pe|ek|a|an|the|ya|or|chahiye|dekhna|potrait|portrait|portait|portret|tasveer|tasvir|chitra|naksha|photo|photos|foto|fotos|pic|pics|picture|pictures|image|images|imag|imge|img|imgs|imeg|imaj|flowchart|flow\s+chart|diagram|diagrams|draw|drawing|zariye|madhyam|samjhao|samjha|batao)\b/gi;
+const topicNoiseRegex = /\b(?:is\s+topic|this\s+topic|is\s+concept|this\s+concept|is\s+chapter|this\s+chapter|is\s+personality|current\s+topic|topic|concept|personality|portrait|potrait|diagram|map|naksha|tasveer|tasvir|chitra|image|photo|pic)\b/gi;
+
+// Canonical mapping for prominent historical & scientific personalities
+const canonicalEntityMap: Record<string, string> = {
+  "modi": "Narendra Modi",
+  "narendra modi": "Narendra Modi",
+  "pm modi": "Narendra Modi",
+  "prime minister modi": "Narendra Modi",
+  "patel": "Vallabhbhai Patel",
+  "sardar patel": "Vallabhbhai Patel",
+  "vallabhbhai patel": "Vallabhbhai Patel",
+  "kalam": "A. P. J. Abdul Kalam",
+  "abdul kalam": "A. P. J. Abdul Kalam",
+  "apj abdul kalam": "A. P. J. Abdul Kalam",
+  "ashoka": "Ashoka",
+  "akbar": "Akbar",
+  "shah jahan": "Shah Jahan",
+  "babur": "Babur",
+  "alexander": "Alexander the Great",
+  "caesar": "Julius Caesar",
+  "aristotle": "Aristotle",
+  "plato": "Plato",
+  "socrates": "Socrates",
+  "da vinci": "Leonardo da Vinci",
+  "leonardo da vinci": "Leonardo da Vinci",
+  "lincoln": "Abraham Lincoln",
+  "churchill": "Winston Churchill",
+  "trump": "Donald Trump",
+  "biden": "Joe Biden",
+  "obama": "Barack Obama",
+  "ramanujan": "Srinivasa Ramanujan",
+  "hitler": "Adolf Hitler",
+  "curie": "Marie Curie",
+  "einstein": "Albert Einstein",
+  "newton": "Isaac Newton",
+  "darwin": "Charles Darwin",
+  "galileo": "Galileo Galilei",
+  "tesla": "Nikola Tesla",
+  "gandhi": "Mahatma Gandhi",
+  "bose": "Subhas Chandra Bose",
+  "nehru": "Jawaharlal Nehru",
+  "ambedkar": "B. R. Ambedkar",
+  "bhagat singh": "Bhagat Singh",
+  "tagore": "Rabindranath Tagore",
+  "aryabhata": "Aryabhata",
+  "shivaji": "Chhatrapati Shivaji Maharaj",
+  "napoleon": "Napoleon",
+  "shakespeare": "William Shakespeare",
+  "bohr": "Niels Bohr",
+  "rutherford": "Ernest Rutherford",
+  "pasteur": "Louis Pasteur",
+  "mendel": "Gregor Mendel",
+  "faraday": "Michael Faraday",
+  "maxwell": "James Clerk Maxwell",
+  "edison": "Thomas Edison",
+  "fleming": "Alexander Fleming",
+  "hawking": "Stephen Hawking"
+};
+
+function getCanonicalEntityName(rawName: string): string {
+  if (!rawName) return "";
+  const lower = rawName.toLowerCase().trim();
+  for (const [key, canon] of Object.entries(canonicalEntityMap)) {
+    if (new RegExp(`\\b${key}\\b`, "i").test(lower)) {
+      return canon;
+    }
+  }
+  return rawName.trim();
+}
+
+function extractAcademicSubject(rawQuery: string, chatHistory?: any[], docTitle?: string): string {
+  // 1. Detect if query contains anaphoric pronouns or purely attribute words without a concrete named entity
+  const hasPronoun = anaphoricPronounsRegex.test(rawQuery);
+
+  // Clean rawQuery of noise and conversational pleasantries
+  let clean = rawQuery
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/[?!.,;:"'()[\]{}]/g, " ")
+    .replace(visualNoiseRegex, " ")
+    .replace(conversationalPrefixRegex, " ")
+    .replace(topicNoiseRegex, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  // Strip all pronouns and filler tokens to test if the query contains an explicit new entity
+  const queryWithoutPronounsOrFiller = clean
+    .replace(anaphoricPronounsRegex, " ")
+    .replace(conversationalPrefixRegex, " ")
+    .replace(/\b(?:koi|kisi|kuch|sab|apna|apni|apne|meri|mera|mere|teri|tera|tere|sir|bhai|yaar|please|kripya|chahiye|dekhna|dikhao|batao|samjhao)\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  // If the query is just attribute words (like "life", "timeline", "discoveries") or has anaphora ("inka", "unke", "iski")
+  const isPureAttribute = attributeWordsRegex.test(clean) && !/\b(?:einstein|newton|galileo|darwin|curie|bohr|tesla|rutherford|scorpio|gandhi|nehru|hitler|war|mughal|cell|atom|photosynthesis|dna|rna|light|sound|electricity|magnetism|gravity|motion|force)\b/i.test(clean);
+
+  const isAnaphoric = hasPronoun || queryWithoutPronounsOrFiller.length < 2 || isPureAttribute;
+
+  // 2. If pronoun or pure attribute is detected, find antecedent entity from chat history
+  let antecedentEntity = "";
+  if (Array.isArray(chatHistory) && chatHistory.length > 0) {
+    const recent = chatHistory.slice().reverse();
+    for (const msg of recent) {
+      if (msg && typeof msg.text === 'string') {
+        const text = msg.text;
+
+        // A. Search for prominent historical figures, scientists, or scientific topics in previous turns
+        const academicKeywords = text.match(/\b(?:Marie\s+Curie|Madam\s+Curie|Pierre\s+Curie|Albert\s+Einstein|Einstein|Isaac\s+Newton|Newton|Galileo(?:\s+Galilei)?|Charles\s+Darwin|Darwin|Nikola\s+Tesla|Tesla|Niels\s+Bohr|Bohr|Ernest\s+Rutherford|Rutherford|Louis\s+Pasteur|Pasteur|Gregor\s+Mendel|Mendel|Michael\s+Faraday|Faraday|James\s+Clerk\s+Maxwell|Maxwell|Thomas\s+Edison|Edison|Alexander\s+Fleming|Fleming|Stephen\s+Hawking|Hawking|Subhash\s+Chandra\s+Bose|Mahatma\s+Gandhi|Jawaharlal\s+Nehru|B\.\s*R\.\s*Ambedkar|Bhagat\s+Singh|Rabindranath\s+Tagore|William\s+Shakespeare|Robert\s+Frost|John\s+Keats|William\s+Wordsworth|Nissim\s+Ezekiel|World\s+War\s+[12I|V]+|French\s+Revolution|Russian\s+Revolution|Indian\s+National\s+Movement|Photosynthesis|Cell\s+Division|Mitosis|Meiosis|Periodic\s+Table|Thermodynamics|Quantum\s+Mechanics|Relativity|Ohm's\s+Law|Newton's\s+Laws|Gravitation|Night\s+of\s+the\s+Scorpion)\b/i);
+
+        if (academicKeywords && academicKeywords[0]) {
+          if (/Marie\s+Curie/i.test(text)) {
+            antecedentEntity = "Marie Curie";
+          } else {
+            antecedentEntity = academicKeywords[0];
+          }
+          break;
+        }
+
+        // B. Look for markdown headings in AI answers (e.g. ### Marie Curie or ### Photosynthesis)
+        const headingMatch = text.match(/###?\s+([^:\n\r#|`]+)/);
+        if (headingMatch && headingMatch[1]) {
+          const cand = headingMatch[1].replace(/\b(?:Life|Timeline|Overview|Breakdown|Concepts?|Explanation|Summary|Journey)\b/gi, '').trim();
+          if (cand.length >= 3 && !anaphoricPronounsRegex.test(cand)) {
+            antecedentEntity = cand;
+            break;
+          }
+        }
+
+        // C. Look for bolded entity names in AI answers (e.g. **Marie Curie**)
+        const boldMatches = text.match(/\*\*([A-Z][a-zA-Z0-9\s'-]{2,30})\*\*/g);
+        if (boldMatches && boldMatches.length > 0) {
+          for (const bm of boldMatches) {
+            const raw = bm.replace(/\*/g, '').trim();
+            if (raw.length >= 3 && !anaphoricPronounsRegex.test(raw) && !/^(?:Note|Key|Tip|Summary|Definition|Important|Rule|Stage|Step|Phase|Flowchart)$/i.test(raw)) {
+              antecedentEntity = raw;
+              break;
+            }
+          }
+          if (antecedentEntity) break;
+        }
+
+        // D. Look in prior user messages
+        if (msg.role === 'user' && text !== rawQuery) {
+          const cand = text
+            .replace(/```[\s\S]*?```/g, ' ')
+            .replace(/[?!.,;:"'()[\]{}]/g, ' ')
+            .replace(visualNoiseRegex, ' ')
+            .replace(topicNoiseRegex, ' ')
+            .replace(anaphoricPronounsRegex, ' ')
+            .replace(/\b(?:mujhe|kripya|please|batao|explain|detail\s+me|samjhao|kya|kyu|kyun|hai|hain|tha|the|bhi|aur|ka|ki|ke|in|on|at|of|the|a|an|tell|about|chahiye|karo|kaise|koi|kisi)\b/gi, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+          if (cand.length >= 3 && !anaphoricPronounsRegex.test(cand)) {
+            antecedentEntity = cand;
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  // If query was anaphoric (e.g. "Inka koi image dikhao" or "unke life ko")
+  if (isAnaphoric && antecedentEntity) {
+    if (attributeWordsRegex.test(clean) || attributeWordsRegex.test(rawQuery)) {
+      return `${antecedentEntity} (Life & Career Timeline)`;
+    }
+    return antecedentEntity;
+  }
+
+  if (queryWithoutPronounsOrFiller.length >= 2 && !isAnaphoric) {
+    return queryWithoutPronounsOrFiller;
+  }
+
+  if (antecedentEntity) {
+    return antecedentEntity;
+  }
+
+  // 3. Fallback to doc title if it contains a recognizable subject
+  if (docTitle && typeof docTitle === 'string') {
+    const cleanTitle = docTitle
+      .replace(/\.[a-zA-Z0-9]+$/, '')
+      .replace(/[-_]/g, ' ')
+      .replace(/\b(?:class|standard|grade|ncert|cbse|chapter|unit|module|lesson|book|\d+|copy|english|hindi|science|maths?)\b/gi, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (cleanTitle.length >= 4) return cleanTitle;
+  }
+
+  return clean || "";
+}
+
+async function fetchLiveInternetGrounding(query: string): Promise<string> {
+  if (!query || query.trim().length < 4) return "";
+  // Do NOT search internet on casual greetings or conversational pleasantries
+  if (isGreeting(query) || isConversationalPleasantry(query)) return "";
+
+  try {
+    const cleanQ = query
+      .replace(/[?!.,;:"'()[\]{}]/g, " ")
+      .replace(/\b(?:kya|kyu|kaise|batao|explain|samjhao|detail\s+me|verify|latest|current|up\s+to\s+date|information|karo|bhai|yaar|hi|hello|hey|theek|achha|ok|please)\b/gi, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (cleanQ.length < 3) return "";
+
+    // 1. Wikipedia Summary REST API (unmatched verified encyclopedic knowledge)
+    const wikiResp = await fetch(`https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(cleanQ)}`, {
+      headers: { "User-Agent": "SAYAD-Academic-App/1.0 (educational research)" }
+    });
+    if (wikiResp.ok) {
+      const wikiData: any = await wikiResp.json();
+      if (wikiData && wikiData.extract) {
+        return `[VERIFIED LIVE ENCYCLOPEDIC KNOWLEDGE (${wikiData.title})]:\n${wikiData.extract}`;
+      }
+    }
+
+    // 2. DuckDuckGo Instant Knowledge API
+    const ddgResp = await fetch(`https://api.duckduckgo.com/?q=${encodeURIComponent(cleanQ)}&format=json&no_html=1&skip_disambig=1`, {
+      headers: { "User-Agent": "SAYAD-Academic-App/1.0" }
+    });
+    if (ddgResp.ok) {
+      const ddgData: any = await ddgResp.json();
+      const abstract = ddgData.AbstractText || ddgData.Abstract;
+      if (abstract) {
+        return `[VERIFIED LIVE KNOWLEDGE GROUNDING (${ddgData.Heading || cleanQ})]:\n${abstract}`;
+      }
+    }
+  } catch (err) {
+    console.warn("Internet grounding fetch notice:", err);
+  }
+  return "";
+}
+
+function isDocumentSpecificQuery(userQuestion: string): boolean {
+  return /\b(?:this\s+(?:book|pdf|document|chapter|page|lesson|poem|story|file|module)|in\s+the\s+(?:book|pdf|text|story|poem|chapter|module)|page\s+\d+|intext\s+question|exercise\s+\d+|question\s+\d+|is\s+(?:page|chapter|kitab|poem|kahani|adhyaye?|paath|module)|iss\s+(?:page|chapter|kitab|poem|kahani|adhyaye?|paath|module)|ye\s+chapter|yeh\s+chapter|author\s+of\s+this|poet\s+of\s+this)\b/i.test(userQuestion);
+}
+
+function cleanImageUrl(rawUrl: string): string {
+  if (!rawUrl) return "";
+  let clean = rawUrl.split("?")[0];
+  clean = clean.replace(/\(/g, "%28").replace(/\)/g, "%29");
+  return clean;
+}
+
+async function fetchEducationalInternetImage(rawQuery: string, fallbackSubject?: string): Promise<{ imageUrl: string; title: string; description: string; source: string } | null> {
+  if (!rawQuery && !fallbackSubject) return null;
+
+  const hasPronoun = anaphoricPronounsRegex.test(rawQuery || "");
+  let cleanQuery = "";
+
+  // If query contains pronouns (inka, unka, iska, etc.) or is empty, immediately prioritize fallbackSubject!
+  if ((hasPronoun || !rawQuery || rawQuery.trim().length < 2) && fallbackSubject && fallbackSubject.trim().length >= 2) {
+    cleanQuery = fallbackSubject.trim();
+  } else {
+    cleanQuery = (rawQuery || "")
+      .replace(/```[\s\S]*?```/g, " ")
+      .replace(/[?!.,;:"'()[\]{}]/g, " ")
+      .replace(visualNoiseRegex, " ")
+      .replace(conversationalPrefixRegex, " ")
+      .replace(topicNoiseRegex, " ")
+      .replace(anaphoricPronounsRegex, " ")
+      .replace(/\b(?:koi|kisi|kuch|sab|apna|apni|apne|meri|mera|mere|teri|tera|tere|sir|bhai|yaar|please|kripya)\b/gi, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    if ((cleanQuery.length < 2 || anaphoricPronounsRegex.test(cleanQuery)) && fallbackSubject && fallbackSubject.trim().length >= 2) {
+      cleanQuery = fallbackSubject.trim();
+    }
+  }
+
+  // Remove any timeline or parenthesis context (e.g. "Marie Curie (Life & Career Timeline)" -> "Marie Curie")
+  cleanQuery = cleanQuery.replace(/\s*\([^)]*\)/g, "").trim();
+
+  // Resolve to canonical historical/scientific name if matched (e.g. Hitler -> Adolf Hitler)
+  cleanQuery = getCanonicalEntityName(cleanQuery);
+
+  if (!cleanQuery || cleanQuery.length < 2) return null;
+
+  const isMap = /\b(?:map|naksha|alliances|boundaries|territory|geographical)\b/i.test(rawQuery);
+  const isPortrait = /\b(?:portrait|potrait|portait|chehra|tasveer|tasvir|photo|chitra|personality)\b/i.test(rawQuery) || !isMap;
+  const isDiagram = /\b(?:diagram|structure|flowchart|anatomy|labeled|scientific)\b/i.test(rawQuery);
+
+  const searchKeywords = [
+    cleanQuery,
+    isPortrait && !cleanQuery.toLowerCase().includes("portrait") ? `${cleanQuery} portrait` : null,
+    isMap && !cleanQuery.toLowerCase().includes("map") ? `${cleanQuery} map` : null,
+    isDiagram && !cleanQuery.toLowerCase().includes("diagram") ? `${cleanQuery} diagram` : null,
+  ].filter(Boolean) as string[];
+
+  // 1. If map or diagram, search Wikimedia Commons first for high-res educational SVGs/PNGs
+  if (isMap || isDiagram) {
+    for (const kw of searchKeywords) {
+      try {
+        const commonsUrl = `https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrsearch=${encodeURIComponent(kw)}&gsrnamespace=6&gsrlimit=6&prop=imageinfo&iiprop=url|size|mime&format=json`;
+        const resp = await fetch(commonsUrl, { headers: { "User-Agent": "SAYAD-Academic-App/2.0 (educational research)" } });
+        if (resp.ok) {
+          const data: any = await resp.json();
+          const pages = data?.query?.pages;
+          if (pages) {
+            for (const pageId of Object.keys(pages)) {
+              const p = pages[pageId];
+              const info = p?.imageinfo?.[0];
+              const url = info?.url;
+              if (url && (url.endsWith(".svg") || url.endsWith(".png") || url.endsWith(".jpg") || url.endsWith(".jpeg") || url.endsWith(".webp"))) {
+                if ((info.width && info.width > 200) || url.endsWith(".svg")) {
+                  const title = (p.title || cleanQuery).replace(/^File:/i, "").replace(/\.[a-zA-Z0-9]+$/, "").replace(/_/g, " ");
+                  return {
+                    imageUrl: cleanImageUrl(url),
+                    title,
+                    description: `Authentic educational visual archive from Wikimedia Commons archives.`,
+                    source: "Wikimedia Commons (Open Educational Archive)"
+                  };
+                }
+              }
+            }
+          }
+        }
+      } catch (err) {
+        console.warn("[Wikimedia Commons Image Search Error]:", err);
+      }
+    }
+  }
+
+  // 2. Search Wikipedia API with smart entity scoring (ensures primary subject matches)
+  for (const kw of searchKeywords) {
+    try {
+      const wikiUrl = `https://en.wikipedia.org/w/api.php?action=query&generator=search&gsrsearch=${encodeURIComponent(kw)}&gsrlimit=8&prop=pageimages|extracts&piprop=original|thumbnail&pithumbsize=1200&exintro=1&explaintext=1&format=json`;
+      const resp = await fetch(wikiUrl, { headers: { "User-Agent": "SAYAD-Academic-App/2.0 (educational research)" } });
+      if (resp.ok) {
+        const data: any = await resp.json();
+        const pages = Object.values(data?.query?.pages || {});
+
+        const scored = pages.map((p: any) => {
+          let score = 0;
+          const title = (p.title || "").toLowerCase();
+          const q = cleanQuery.toLowerCase();
+          const img = p?.thumbnail?.source || p?.original?.source;
+          if (!img) return { page: p, score: -100 };
+
+          // Direct title match
+          if (title === q) score += 100;
+          else if (title.startsWith(q) || q.startsWith(title)) score += 80;
+          else if (title.includes(q)) score += 60;
+
+          // Penalize secondary/incident articles (treaties, filmographies, controversies, death accounts)
+          if (/\b(?:disambiguation|death of|views of|film|filmography|movie|treaty|concordat|reichskonkordat|list of|album|song)\b/i.test(title)) {
+            score -= 70;
+          }
+
+          // Penalize flags/SVG logos when seeking a person's photo/portrait
+          if (img.includes('.svg') && (title.includes('flag') || title.includes('coat_of_arms') || title.includes('germany') || title.includes('party'))) {
+            score -= 50;
+          }
+
+          return { page: p, score, title: p.title, img, extract: p.extract };
+        }).filter((x: any) => x.score > 0);
+
+        scored.sort((a: any, b: any) => b.score - a.score);
+
+        if (scored.length > 0) {
+          const best = scored[0];
+          return {
+            imageUrl: cleanImageUrl(best.img),
+            title: best.title,
+            description: best.extract ? best.extract.slice(0, 350) + "…" : "",
+            source: `Wikipedia Official Archives (${best.title})`
+          };
+        }
+      }
+    } catch (err) {
+      console.warn("[Wikipedia Image Search Error]:", err);
+    }
+  }
+
+  // 3. Fallback check on Wikimedia Commons if Wikipedia didn't have an image
+  if (!isMap && !isDiagram) {
+    for (const kw of searchKeywords) {
+      try {
+        const commonsUrl = `https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrsearch=${encodeURIComponent(kw)}&gsrnamespace=6&gsrlimit=3&prop=imageinfo&iiprop=url|size&format=json`;
+        const resp = await fetch(commonsUrl, { headers: { "User-Agent": "SAYAD-Academic-App/1.0 (educational research)" } });
+        if (resp.ok) {
+          const data: any = await resp.json();
+          const pages = data?.query?.pages;
+          if (pages) {
+            for (const pageId of Object.keys(pages)) {
+              const p = pages[pageId];
+              const info = p?.imageinfo?.[0];
+              const url = info?.url;
+              if (url && (url.endsWith(".svg") || url.endsWith(".png") || url.endsWith(".jpg") || url.endsWith(".jpeg") || url.endsWith(".webp"))) {
+                const title = (p.title || cleanQuery).replace(/^File:/i, "").replace(/\.[a-zA-Z0-9]+$/, "").replace(/_/g, " ");
+                return {
+                  imageUrl: cleanImageUrl(url),
+                  title,
+                  description: "",
+                  source: "Wikimedia Commons"
+                };
+              }
+            }
+          }
+        }
+      } catch (err) {}
+    }
+  }
+
+  // 4. Ultimate Educational Fallback via DuckDuckGo Open Web Images (ensures any figure, leader, or concept works)
+  for (const kw of searchKeywords) {
+    const ddgImg = await fetchDuckDuckGoImage(kw);
+    if (ddgImg && ddgImg.imageUrl) {
+      return {
+        imageUrl: ddgImg.imageUrl,
+        title: ddgImg.title || cleanQuery,
+        description: `Visual reference from educational open archives for ${cleanQuery}.`,
+        source: ddgImg.source
+      };
+    }
+  }
+
+  return null;
+}
+
+async function fetchDuckDuckGoImage(query: string): Promise<{ imageUrl: string; title: string; source: string } | null> {
+  try {
+    const tokenResp = await fetch(`https://duckduckgo.com/?q=${encodeURIComponent(query)}&iax=images&ia=images`, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+      },
+      signal: AbortSignal.timeout(5000)
+    });
+    const html = await tokenResp.text();
+    const vqdMatch = html.match(/vqd=([0-9-]+)/) || html.match(/vqd="([0-9-]+)"/);
+    if (!vqdMatch) return null;
+    const vqd = vqdMatch[1];
+    const imgResp = await fetch(`https://duckduckgo.com/i.js?l=us-en&o=json&q=${encodeURIComponent(query)}&vqd=${vqd}&f=,,,`, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+      },
+      signal: AbortSignal.timeout(6000)
+    });
+    if (!imgResp.ok) return null;
+    const data: any = await imgResp.json();
+    const results = data?.results || [];
+    if (results.length > 0) {
+      for (const r of results) {
+        if (r.image && (r.image.startsWith("http://") || r.image.startsWith("https://"))) {
+          return {
+            imageUrl: cleanImageUrl(r.image),
+            title: r.title || query,
+            source: `Web Educational Archive (${r.source || 'DuckDuckGo'})`
+          };
+        }
+      }
+    }
+  } catch (err: any) {
+    console.warn("[DDG Image Search Error]:", err?.message);
+  }
+  return null;
+}
+
+function sanitizeAIResponse(text: string): string {
+  if (!text) return text;
+  return text
+    // Strip repetitive book disclaimers
+    .replace(/\s*\(\s*(?:External Knowledge|Web Search|Book ke bahar se)[^)]*\)/gi, "")
+    .replace(/\*+\s*\(\s*(?:External Knowledge|Web Search|Book ke bahar se)[^)]*\)\s*\*+/gi, "")
+    // Strip trailing nagging prompts to return to the book
+    .replace(/(?:Would you like to (?:continue with|return to) your .*? textbook|Ready to (?:return to|tackle) .*?\?)\s*$/gi, "")
+    .trim();
+}
+
+async function generateAIImage(prompt: string): Promise<{ imageUrl: string; description?: string } | null> {
+  const apiKey = process.env.OPENROUTER_API_KEY || process.env.OPENROUTER_AI;
+  if (!apiKey) return null;
+
+  try {
+    const resp = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`,
+        "HTTP-Referer": "https://aistudio.google.com",
+        "X-Title": "SAYAD Super Tutor Visuals"
+      },
+      body: JSON.stringify({
+        model: "google/gemini-2.5-flash-image",
+        messages: [{
+          role: "user",
+          content: `Create a clean, detailed, textbook-quality educational illustration or visual diagram of: ${prompt}. Ensure high clarity and educational value.`
+        }],
+        modalities: ["image", "text"]
+      })
+    });
+
+    if (resp.ok) {
+      const data: any = await resp.json();
+      const choice = data?.choices?.[0];
+      const images = choice?.message?.images;
+      if (images && images.length > 0) {
+        const imgObj = images[0];
+        const imageUrl = imgObj?.image_url?.url || imgObj?.url;
+        if (imageUrl) {
+          return {
+            imageUrl,
+            description: choice?.message?.content || prompt
+          };
+        }
+      }
+    }
+  } catch (err: any) {
+    console.warn("[AI Image Generation notice]:", err?.message);
   }
   return null;
 }
@@ -534,6 +1175,164 @@ async function startServer() {
     }
   });
 
+  // Resilient High-Performance Image Proxy (bypasses mobile carrier blocks, referer filters, CORS, and rate limits)
+  const imageProxyCache = new Map<string, { buffer: Buffer; contentType: string; time: number }>();
+  const MAX_IMAGE_CACHE = 150;
+
+  function setCacheItem(key: string, item: { buffer: Buffer; contentType: string; time: number }) {
+    if (imageProxyCache.size >= MAX_IMAGE_CACHE) {
+      const firstKey = imageProxyCache.keys().next().value;
+      if (firstKey) imageProxyCache.delete(firstKey);
+    }
+    imageProxyCache.set(key, item);
+  }
+
+  function generateFallbackSvg(subject: string): string {
+    const clean = (subject || "Academic Visual").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    return `<svg xmlns="http://www.w3.org/2000/svg" width="800" height="480" viewBox="0 0 800 480">
+      <defs>
+        <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+          <stop offset="0%" stop-color="#0f172a"/>
+          <stop offset="100%" stop-color="#1e293b"/>
+        </linearGradient>
+        <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="0%">
+          <stop offset="0%" stop-color="#38bdf8"/>
+          <stop offset="100%" stop-color="#818cf8"/>
+        </linearGradient>
+      </defs>
+      <rect width="100%" height="100%" fill="url(#bg)" rx="16"/>
+      <circle cx="400" cy="180" r="64" fill="rgba(56, 189, 248, 0.1)" stroke="url(#accent)" stroke-width="2"/>
+      <text x="400" y="196" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif" font-size="44" text-anchor="middle" fill="#38bdf8">🖼️</text>
+      <text x="400" y="290" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif" font-size="24" font-weight="bold" text-anchor="middle" fill="#f8fafc">${clean}</text>
+      <text x="400" y="324" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif" font-size="14" text-anchor="middle" fill="#94a3b8">Authentic Academic Archive Reference</text>
+    </svg>`;
+  }
+
+  app.get("/api/image-proxy", async (req, res) => {
+    try {
+      let rawUrl = (req.query.url as string) || "";
+      const subject = (req.query.subject as string) || "";
+
+      // Check cache first for instant sub-millisecond response
+      const cacheKey = rawUrl || subject;
+      if (cacheKey && imageProxyCache.has(cacheKey)) {
+        const cached = imageProxyCache.get(cacheKey)!;
+        res.setHeader("Content-Type", cached.contentType);
+        res.setHeader("Cache-Control", "public, max-age=604800, immutable");
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        return res.send(cached.buffer);
+      }
+
+      // If no URL was provided but subject was, automatically search an authentic image for subject
+      if (!rawUrl && subject) {
+        const found = await fetchEducationalInternetImage(subject);
+        if (found && found.imageUrl) {
+          rawUrl = found.imageUrl;
+        }
+      }
+
+      if (!rawUrl) {
+        const svg = generateFallbackSvg(subject || "Educational Visual");
+        res.setHeader("Content-Type", "image/svg+xml");
+        res.setHeader("Cache-Control", "public, max-age=86400");
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        return res.send(Buffer.from(svg));
+      }
+
+      // Safely handle URL decoding (avoid URI malformed if already decoded)
+      let targetUrl = rawUrl.trim();
+      if (/^https?%3A%2F%2F/i.test(targetUrl)) {
+        try {
+          targetUrl = decodeURIComponent(targetUrl);
+        } catch (e) {}
+      }
+
+      let parsed: URL;
+      try {
+        parsed = new URL(targetUrl);
+      } catch {
+        try {
+          parsed = new URL(encodeURI(targetUrl));
+        } catch {
+          const svg = generateFallbackSvg(subject || "Educational Visual");
+          res.setHeader("Content-Type", "image/svg+xml");
+          res.setHeader("Access-Control-Allow-Origin", "*");
+          return res.send(Buffer.from(svg));
+        }
+      }
+
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        return res.status(400).send("Invalid protocol");
+      }
+
+      let upstream: Response | null = null;
+      try {
+        upstream = await fetch(parsed.toString(), {
+          headers: {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9"
+          },
+          signal: AbortSignal.timeout(9000),
+          redirect: "follow"
+        });
+      } catch (fetchErr: any) {
+        console.warn("[Proxy Fetch Timeout/Error]:", fetchErr?.message);
+      }
+
+      // If upstream failed or returned non-200, try alternative search for subject
+      if (!upstream || !upstream.ok) {
+        if (subject) {
+          const altImg = await fetchEducationalInternetImage(subject);
+          if (altImg && altImg.imageUrl && altImg.imageUrl !== targetUrl) {
+            try {
+              const altUpstream = await fetch(altImg.imageUrl, {
+                headers: {
+                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                },
+                signal: AbortSignal.timeout(8000),
+                redirect: "follow"
+              });
+              if (altUpstream.ok) {
+                const contentType = altUpstream.headers.get("content-type") || "image/jpeg";
+                const arrayBuffer = await altUpstream.arrayBuffer();
+                const buf = Buffer.from(arrayBuffer);
+                setCacheItem(cacheKey, { buffer: buf, contentType, time: Date.now() });
+                res.setHeader("Content-Type", contentType);
+                res.setHeader("Cache-Control", "public, max-age=604800, immutable");
+                res.setHeader("Access-Control-Allow-Origin", "*");
+                return res.send(buf);
+              }
+            } catch (e) {}
+          }
+        }
+
+        const svg = generateFallbackSvg(subject || "Educational Archive Visual");
+        res.setHeader("Content-Type", "image/svg+xml");
+        res.setHeader("Cache-Control", "public, max-age=86400");
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        return res.send(Buffer.from(svg));
+      }
+
+      const contentType = upstream.headers.get("content-type") || "image/jpeg";
+      const arrayBuffer = await upstream.arrayBuffer();
+      const buf = Buffer.from(arrayBuffer);
+
+      setCacheItem(cacheKey, { buffer: buf, contentType, time: Date.now() });
+
+      res.setHeader("Content-Type", contentType);
+      res.setHeader("Cache-Control", "public, max-age=604800, immutable");
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      return res.send(buf);
+    } catch (err: any) {
+      console.warn("[Image Proxy Error]:", err?.message);
+      const svg = generateFallbackSvg("Educational Visual");
+      res.setHeader("Content-Type", "image/svg+xml");
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      return res.send(Buffer.from(svg));
+    }
+  });
+
   // Dedicated AI Study Tools Endpoint (Summarize, Explain, Flashcards, MCQs, Revision, Meaning, Key Facts)
   app.post("/api/ai/study-tool", async (req, res) => {
     try {
@@ -586,15 +1385,15 @@ async function startServer() {
         }
       }
 
-      // 3. OpenRouter LLaMA 3.3 70B Fallback
+      // 3. OpenRouter (DeepSeek V3 / LLaMA 3.3 70B) Fallback
       if (process.env.OPENROUTER_API_KEY || process.env.OPENROUTER_AI) {
-        const orText = await executeWithOpenRouter(queryPrompt, studySysInstruction, 0.25);
-        if (orText) {
+        const orResult = await executeWithOpenRouter(queryPrompt, studySysInstruction, 0.25);
+        if (orResult && orResult.text) {
           return res.json({
-            text: orText,
+            text: orResult.text,
             status: "success",
             provider: "openrouter",
-            model: "llama-3.3-70b",
+            model: orResult.model,
             toolKey: toolKey || "study-tool"
           });
         }
@@ -750,16 +1549,16 @@ Return ONLY a valid raw JSON object with this exact structure:
 
       // 3. OpenRouter Fallback
       if (process.env.OPENROUTER_API_KEY || process.env.OPENROUTER_AI) {
-        const orText = await executeWithOpenRouter(lexiconPrompt, lexiconSysInstruction, 0.1);
-        if (orText) {
+        const orResult = await executeWithOpenRouter(lexiconPrompt, lexiconSysInstruction, 0.1);
+        if (orResult && orResult.text) {
           try {
-            const cleaned = orText.replace(/```json/gi, '').replace(/```/g, '').trim();
+            const cleaned = orResult.text.replace(/```json/gi, '').replace(/```/g, '').trim();
             const parsed = JSON.parse(cleaned);
             return res.json({
               data: parsed,
               status: "success",
               provider: "openrouter",
-              model: "llama-3.3-70b",
+              model: orResult.model,
             });
           } catch (pErr) {}
         }
@@ -841,9 +1640,9 @@ Return ONLY a valid raw JSON object with this exact structure:
 
       // Tier 3: OpenRouter API (if configured in environment)
       if (process.env.OPENROUTER_API_KEY || process.env.OPENROUTER_AI) {
-        const orText = await executeWithOpenRouter(prompt, systemInstruction, typeof temperature === "number" ? temperature : 0.3);
-        if (orText) {
-          return res.json({ text: orText, status: "success", provider: "openrouter", model: "llama-3.3-70b" });
+        const orResult = await executeWithOpenRouter(prompt, systemInstruction, typeof temperature === "number" ? temperature : 0.3);
+        if (orResult && orResult.text) {
+          return res.json({ text: orResult.text, status: "success", provider: "openrouter", model: orResult.model });
         }
       }
 
@@ -873,89 +1672,345 @@ Return ONLY a valid raw JSON object with this exact structure:
         persona,
         language,
         chatHistory,
-        customKey
+        customKey,
+        preferredEngine
       } = req.body;
 
       if (!userQuestion) {
         return res.status(400).json({ error: "Missing userQuestion" });
       }
 
-      // Format conversation history for multi-turn conversational context
+      // 1. Check if user is sending a casual greeting / pleasantry
+      if (isGreeting(userQuestion)) {
+        const userLang = detectUserLanguage(userQuestion);
+        let greetingReply = "";
+        if (userLang === "Hinglish") {
+          greetingReply = "Hey! Main bilkul badhiya hoon. Aap batao, aaj kya padhna ya discuss karna chahte ho — koi concept samajhna hai, questions solve karne hain, ya koi topic detail me dekhna hai?";
+        } else if (userLang === "Hindi") {
+          greetingReply = "नमस्ते! मैं बिल्कुल ठीक हूँ। आज आपकी पढ़ाई में मैं किस प्रकार मदद कर सकता हूँ? कोई अध्याय, प्रश्न या विषय समझना हो तो बताइए।";
+        } else {
+          greetingReply = "Hey! How's your study session going? What are we working on or exploring today?";
+        }
+        return res.json({
+          text: greetingReply,
+          status: "success",
+          engine: "conversational-tutor"
+        });
+      }
+
+      // 1.1. Check if user is sending an acknowledgement / pleasantry (e.g. "theek hai", "ok", "samajh gaya")
+      if (isConversationalPleasantry(userQuestion)) {
+        const userLang = detectUserLanguage(userQuestion);
+        let ackReply = "";
+        if (userLang === "Hinglish") {
+          ackReply = "Badhiya! Aur koi concept samajhna ho ya koi specific question/diagram dekhna ho, toh batao — main yahin hoon.";
+        } else if (userLang === "Hindi") {
+          ackReply = "बहुत बढ़िया! यदि कोई अन्य अवधारणा, प्रश्न या आरेख समझना हो, तो बताएं।";
+        } else {
+          ackReply = "Great! Feel free to ask anytime if you want to explore more concepts or diagrams.";
+        }
+        return res.json({
+          text: ackReply,
+          status: "success",
+          engine: "conversational-tutor"
+        });
+      }
+
+      // 2. Check if user specifically asks for an interactive flowchart / concept diagram / mindmap
+      const isFlowchartRequest = /\b(?:flowchart|flow\s+chart|mindmap|mind\s+map|process\s+diagram|concept\s+map)\b/i.test(userQuestion) || (/\b(?:banao|dikhao|dikha|create|draw|generate|visualize)\b/i.test(userQuestion) && /\b(?:flowchart|flow\s+chart|process|steps|pipeline|workflow)\b/i.test(userQuestion));
+
+      if (isFlowchartRequest) {
+        try {
+          const userLang = detectUserLanguage(userQuestion);
+          const resolvedSubject = extractAcademicSubject(userQuestion, chatHistory, docTitle) || userQuestion;
+          console.log(`[Flowchart Request] Query: "${userQuestion}", Subject: "${resolvedSubject}"`);
+
+          const flowchartPrompt = `You are a world-class academic tutor and visual concept designer.
+The student requested an interactive academic flowchart for: "${resolvedSubject}".
+Topic & Context to portray: ${resolvedSubject}. (Ensure diagram and explanation are strictly focused on ${resolvedSubject} and its actual stages/milestones/lifecycle).
+Language to use: ${userLang === "Hinglish" ? "Natural Conversational Hinglish (Roman Hindi + English terms)" : userLang === "Hindi" ? "Pure Hindi (Devanagari)" : "Fluent Academic English"}.
+
+MANDATORY RULES:
+1. First, provide a clean, valid Mermaid.js flowchart in a \`\`\`mermaid code block.
+   - Use 'flowchart TD' (Top-to-Down).
+   - Use simple node IDs (A, B, C, D, E1, E2).
+   - Put clear, descriptive labels inside square brackets, e.g.:
+     A["1. Stage Name: Clear Action/Input"] --> B["2. Next Stage: Description"]
+   - Do NOT use special characters, quotes, or unescaped parentheses inside bracket labels.
+2. Directly below the diagram, provide a thorough, step-by-step academic breakdown:
+   - Explain what happens at each stage of this process.
+   - Detail the underlying mechanism, inputs, outputs, and cause-and-effect relationships.
+   - Highlight high-yield exam takeaways and key scoring concepts.
+3. No introductory greetings or meta-filler. Start directly with the flowchart!`;
+
+          let flowchartResult = "";
+          if (keyPool.hasAnyKey() || customKey) {
+            const expResult = await executeWithGeminiPool('chat', flowchartPrompt, {
+              systemInstruction: `You are an expert visual educator. Create clean, valid Mermaid.js flowcharts and thorough explanations. Language: ${userLang}.`,
+              targetModel: "gemini-3.1-flash-lite",
+              temperature: 0.2,
+              customKey,
+            });
+            flowchartResult = expResult?.text || "";
+          } else if (process.env.OPENROUTER_API_KEY || process.env.OPENROUTER_AI) {
+            const expResult = await executeWithOpenRouter(flowchartPrompt, "You are an expert visual educator.", 0.2);
+            flowchartResult = expResult?.text || "";
+          }
+
+          if (flowchartResult) {
+            return res.json({
+              text: sanitizeAIResponse(flowchartResult),
+              status: "success",
+              engine: "flowchart-generator"
+            });
+          }
+        } catch (fcErr) {
+          console.warn("Flowchart generation error:", fcErr);
+        }
+      }
+
+      // 3. Check if user specifically asks for an image / visual diagram / illustration / picture / map / portrait
+      const hasExplicitVisualWord = /\b(?:image|images|imag|imge|img|imgs|imeg|imaj|picture|pictures|pic|pics|pix|photo|photos|foto|fotos|tasveer|tasvir|chitra|portrait|potrait|portait|portret|diagram|diagrams|naksha|map|maps|visual|visuals|illustration|figure|drawing)\b/i.test(userQuestion);
+      const hasShowAction = /\b(?:dikhao|dikaho|dikha|dikho|dikhdo|dikhadena|dikhye|dikhaye|dikhana|dekhao|deko|dekho|dekhna|dikhwao|show|generate|create|banao|bhejo|send|fetch)\b/i.test(userQuestion);
+
+      const isImageRequest = !isFlowchartRequest && (
+        hasExplicitVisualWord ||
+        /\b(?:generate|create|show|draw|give|make|fetch|send|bhejo)\s+(?:an?\s+)?(?:image|picture|photo|illustration|drawing|map|diagram|portrait|tasveer|chitra)\b/i.test(userQuestion) ||
+        (hasShowAction && (
+          anaphoricPronounsRegex.test(userQuestion) ||
+          attributeWordsRegex.test(userQuestion) ||
+          /\b(?:ka|ki|ke|ko|se|ki\s+ek|ka\s+ek)\b/i.test(userQuestion) ||
+          // Any short entity query like "Ramanujan dikho", "Aryabhata dikhao", "Napoleon dikhao", "Taj Mahal dikhao"
+          userQuestion.trim().split(/\s+/).length <= 6
+        ))
+      );
+
+      if (isImageRequest) {
+        try {
+          const userLang = detectUserLanguage(userQuestion);
+          const resolvedSubject = extractAcademicSubject(userQuestion, chatHistory, docTitle);
+          console.log(`[Visual Request] Query: "${userQuestion}", Resolved Subject: "${resolvedSubject}"`);
+
+          const hasPronoun = anaphoricPronounsRegex.test(userQuestion);
+          const targetVisualSubject = (hasPronoun && resolvedSubject) ? resolvedSubject : (resolvedSubject || userQuestion);
+          const netImg = await fetchEducationalInternetImage(targetVisualSubject, resolvedSubject);
+          if (netImg && netImg.imageUrl) {
+            let explanation = "";
+            const visualLangInstruction = userLang === "Hinglish"
+              ? "Explain this visual in natural, conversational Hinglish (Roman Hindi + English). Do NOT write in pure English."
+              : userLang === "Hindi"
+              ? "Explain this visual in pure, articulate Hindi (Devanagari)."
+              : "Explain this visual in fluent, academic English.";
+
+            const visualContextPrompt = `The student requested an educational visual for: "${netImg.title}".
+We are displaying an authentic educational archive visual titled "${netImg.title}".
+${visualLangInstruction}
+
+Write a comprehensive, high-yield academic breakdown:
+### 🏛️ ${netImg.title} — Key Analysis & Context
+
+Provide:
+1. **Visual Context & Key Elements**: Explain what this authentic visual portrays, key individuals/structures visible, and setting.
+2. **Historical / Scientific Background**: Deep, authoritative explanation of why this figure/event/concept is significant.
+3. **Core Facts & Exam Takeaways**: Key dates, achievements, formulas, or points examiners ask in tests.
+
+Strictly NO greetings, NO filler, and start directly with the analysis.`;
+
+            try {
+              if (keyPool.hasAnyKey() || customKey) {
+                const expResult = await executeWithGeminiPool('chat', visualContextPrompt, {
+                  targetModel: "gemini-3.1-flash-lite",
+                  temperature: 0.25,
+                  customKey,
+                });
+                explanation = expResult?.text || netImg.description || "";
+              } else if (process.env.OPENROUTER_API_KEY || process.env.OPENROUTER_AI) {
+                const expResult = await executeWithOpenRouter(visualContextPrompt, "You are an elite academic educator.", 0.25);
+                explanation = expResult?.text || netImg.description || "";
+              }
+            } catch (expErr) {
+              explanation = netImg.description || "";
+            }
+
+            const proxyUrl = `/api/image-proxy?url=${encodeURIComponent(netImg.imageUrl)}&subject=${encodeURIComponent(netImg.title)}`;
+            const combinedText = `![${netImg.title}](${proxyUrl})\n\n${explanation}`;
+            return res.json({
+              text: sanitizeAIResponse(combinedText),
+              status: "success",
+              engine: "authentic-educational-archive",
+              hasImage: true
+            });
+          }
+
+          // Fallback to Generative AI Image if configured and specific prompt exists
+          if (resolvedSubject && (process.env.OPENROUTER_API_KEY || process.env.OPENROUTER_AI)) {
+            const imgResult = await generateAIImage(resolvedSubject);
+            if (imgResult && imgResult.imageUrl) {
+              let explanation = "";
+              try {
+                const expResult = await executeWithOpenRouter(
+                  `Provide a concise educational breakdown for visual: "${resolvedSubject}". Bullet points only.`,
+                  "You are an expert academic educator."
+                );
+                explanation = expResult?.text || "";
+              } catch(e) {}
+
+              const proxyUrl = `/api/image-proxy?url=${encodeURIComponent(imgResult.imageUrl)}&subject=${encodeURIComponent(resolvedSubject)}`;
+              const combinedText = `![${imgResult.description || resolvedSubject}](${proxyUrl})\n\n${explanation}`;
+              return res.json({
+                text: sanitizeAIResponse(combinedText),
+                status: "success",
+                engine: "openrouter-gemini-image",
+                hasImage: true
+              });
+            }
+          }
+
+          // If no specific image or subject was found, ask nicely instead of showing irrelevant images
+          let guidanceMsg = "";
+          if (userLang === "Hinglish") {
+            guidanceMsg = "Aap kis specific topic, personality ya scientific concept ka map ya image dekhna chahte hain? (Jaise *World War 1 alliances map*, *Albert Einstein portrait*, ya *Plant cell diagram*). Topic ka naam likhein, main turant visual display kar dunga!";
+          } else if (userLang === "Hindi") {
+            guidanceMsg = "आप किस विशिष्ट विषय, व्यक्तित्व या वैज्ञानिक अवधारणा का मानचित्र या चित्र देखना चाहते हैं? (जैसे *प्रथम विश्व युद्ध का नक्शा*, *अल्बर्ट आइंस्टीन का चित्र*, या *पादप कोशिका का आरेख*)। विषय का नाम बताएं, मैं तुरंत प्रस्तुत करूँगा!";
+          } else {
+            guidanceMsg = "Which specific topic, historical figure, or concept would you like a visual of? (e.g., *World War 1 map*, *Albert Einstein portrait*, *Plant cell diagram*). Let me know the topic and I'll display it right away!";
+          }
+
+          return res.json({
+            text: guidanceMsg,
+            status: "success",
+            engine: "tutor-guidance"
+          });
+        } catch (imgErr: any) {
+          console.warn("Visual generation fallback to standard text:", imgErr?.message);
+        }
+      }
+
+      // Format conversation history for multi-turn conversational context (up to 14 turns)
       let historyFormatted = '';
       if (Array.isArray(chatHistory) && chatHistory.length > 0) {
-        const recentTurns = chatHistory.slice(-8).filter((m: any) => m && m.text && m.text !== '…');
+        const recentTurns = chatHistory.slice(-14).filter((m: any) => m && m.text && m.text !== '…');
         if (recentTurns.length > 0) {
-          historyFormatted = `### RECENT CONVERSATION HISTORY (Active Discussion Memory):
-${recentTurns.map((m: any) => `${m.role === 'user' ? 'Student' : 'AI Tutor'}: ${m.text}`).join('\n\n')}
+          historyFormatted = `### RECENT CONVERSATION HISTORY (Active Multi-Turn Dialogue Context):
+${recentTurns.map((m: any) => `${m.role === 'user' ? 'Student' : 'AI Assistant'}: ${m.text}`).join('\n\n')}
 `;
         }
       }
 
-      const hybridPrompt = `You are S.A.Y.A.D. AI — an unrestricted, world-class Academic AI Tutor and Universal Super-Intelligence (powered by Google Gemini).
+      const userLang = detectUserLanguage(userQuestion);
+      const isDocQuery = isDocumentSpecificQuery(userQuestion);
+      const resolvedSubject = extractAcademicSubject(userQuestion, chatHistory, docTitle);
+      const liveInternetGrounding = await fetchLiveInternetGrounding(resolvedSubject || userQuestion);
+
+      const hybridPrompt = `You are an elite, state-of-the-art AI Super-Intelligence and Universal Academic Professor — operating with the exact intelligence, sharp intuition, and natural conversational mastery of ChatGPT (GPT-4o) and Claude (Sonnet 3.5).
 
 ${persona ? `### ACTIVE PERSONA / STYLE:\n${persona}\n` : ''}
-### YOUR PRIMARY DIRECTIVE:
-You are an omniscient, helpful, and friendly AI tutor capable of answering ANY question across all subjects (Physics, Chemistry, Biology, Mathematics, History, Civics, Geography, Economics, Computer Science, Literature, General Doubts, and Competitive Exams).
+### CRITICAL: STRICT LANGUAGE & SCRIPT MIRRORING (CHATGPT / CLAUDE / GEMINI FEEL):
+The student is communicating in: ${userLang}.
 
-### CORE RULES & QUESTION-SOLVING PROTOCOL:
+YOU MUST STRICTLY MIRROR THE STUDENT'S EXACT LANGUAGE AND SCRIPT:
 
-1. **IN-TEXT QUESTIONS & EXERCISES (e.g. "intext questions 7.1", "intext 7.1 ka 3rd question", "exercise 4.2 question 5")**:
-   - **Step 1: EXTRACT THE EXACT QUESTION TEXT**:
-     - Check the reference document passages below (especially sections labeled \`🎯 PRIMARY INTEXT QUESTIONS\` or \`EXACT QUESTIONS\`).
-     - **Find and print the REAL, EXACT question statement from the book** (e.g., *"Question 3: How did the marriage alliance with the Lichchhavi's help Chandragupta?"*).
-     - ❌ **NEVER hallucinate, guess, or invent fake questions!**
-   - **Step 2: COMPLETE, STEP-BY-STEP ACADEMIC ANSWER**:
-     - **If the PDF only has questions (No answer key at the back)**: Solve the question completely and rigorously using the chapter theory passages and your full academic knowledge!
-     - **If the PDF has both questions AND an answer key (e.g. 'Legitimacy, prestige, strength')**: Incorporate the textbook key points into a complete, well-reasoned, articulate explanation explaining WHY and HOW.
-     - Format clearly:
-       **Question [X]:** [Exact question text from the textbook]
-       **Answer:** [Clear, complete, step-by-step verified explanation with context and significance]
+1. **IF HINGLISH (Roman Hindi/Urdu mixed with English, e.g. "bhai ye samjha de", "world war 1 kyu hua tha", "is concept ke main points batao", "kaise karein", "aur detail me batao", "yeh sab kya hai")**:
+   - YOU MUST WRITE IN CONVERSATIONAL HINGLISH (Latin alphabet Roman Hindi mixed with standard English terms).
+   - Talk like an intelligent, friendly mentor or senior professor chatting in natural Hinglish.
+   - Example tone:
+     "Dekho, World War 1 ke shuru hone ke peeche 4 sabse bade reasons the jise hum M-A-I-N formula kehte hain:
+     - **Militarism (सैन्यीकरण)**: Har European country apni sena aur weapons badhane me lagi thi...
+     - **Alliances (गठजोड़)**: Europe do bade camps me divide ho gaya tha..."
+   - ❌ NEVER reply in pure English when the student speaks in Hinglish!
+   - ❌ NEVER reply in Devanagari Hindi when the student speaks in Hinglish!
 
-2. **CHAPTER & LESSON EXPLANATIONS (e.g. "Chapter 8 kya hai", "Lesson 4 samjhao", "Unit 5 overview")**:
-   - ❌ **STRICTLY FORBIDDEN**: NEVER say *"iss module mein yeh chapter nahi hai"*, *"abhi hum page 1 par hain"*, or *"content display nahi ho raha"*.
-   - Provide an authoritative, structured breakdown immediately:
-     - 📖 **Chapter/Lesson Title & Core Theme**
-     - 🔑 **Key Historical / Scientific Concepts & Core Laws**
-     - 🏛️ **Timeline, Major Figures, or Step-by-Step Mechanisms**
-     - 🎯 **Essential Exam Points & Expected Questions**
-   - Use the reference passages if available; otherwise, teach the topic completely using your full academic syllabus mastery (NCERT / NIOS / CBSE / ICSE / State Board).
+2. **IF HINDI (Devanagari, e.g. "यह कैसे काम करता है?", "प्रथम विश्व युद्ध के क्या कारण थे?")**:
+   - YOU MUST REPLY IN PURE, ELEGANT HINDI in Devanagari script.
 
-3. **CONVERSATIONAL MEMORY & FOLLOW-UP QUERIES ("isse related aur information", "aur batao", "explain more")**:
-   - Seamlessly expand on the EXACT topic discussed in the previous turns with deeper analysis, analogies, and solved exam examples.
-   - Do NOT reset to the beginning of the book or get distracted by unrelated pages.
+3. **IF ENGLISH (e.g. "Explain the core causes of WW1", "Summarize page 16")**:
+   - YOU MUST REPLY IN FLUENT, POLISHED ACADEMIC ENGLISH.
 
-4. **GREETINGS & CASUAL CHAT ("Hi", "Hello", "Kaise ho")**:
-   - Reply warmly and politely in 1-2 friendly sentences.
+### ABSOLUTE CONVERSATIONAL DIRECTIVES:
 
-5. **LANGUAGE & FORMATTING**:
-   - Match the student's language (clean, natural English OR fluent, friendly Hinglish).
-   - Use clean Markdown with bold keywords, bullet points, headers, and clean LaTeX math ($E = mc^2$).
+1. **ZERO INTRODUCTORY FLUFF & ZERO PREAMBLES**:
+   - NEVER start responses with filler like: "Certainly!", "That's a great question!", "I'd be happy to explain...", "It seems you'd like to dive deeper...", or meta-commentary.
+   - Start IMMEDIATELY with the core substance and high-impact knowledge.
+   - When the student says "Detail me", "aur batao", "explain more", or asks a follow-up, jump DIRECTLY into the deeper breakdown without any filler.
 
+2. **EXTERNAL KNOWLEDGE & ZERO BOOK APOLOGIES**:
+   - NEVER say: "Since your current textbook is...", "Your book focuses on [Topic] and does not cover this...", "This is not in your book...", or "(External Knowledge / Book ke bahar se)".
+   - NEVER remind the student what book is loaded unless they explicitly asked about the book, chapter, or in-text questions!
+   - If the student asks about World War, Physics, Science, Programming, History, Personalities (e.g. Albert Einstein), or ANY general academic topic: Answer with complete, authoritative, world-class depth, just like ChatGPT or Claude.
+   - NEVER ask the student for page numbers or say "this does not appear in the text".
+
+3. **RESPONSE DEPTH & THOROUGHNESS (DO NOT SKIP SUBTOPICS)**:
+   - When answering, provide a COMPREHENSIVE, WELL-STRUCTURED, and HIGH-YIELD response so that no important nuance or subtopic is missed.
+   - Structure clearly with headings and bullet points:
+     - **Core Concept & Definition**: Clear explanation of the main idea.
+     - **In-Depth Breakdown / Timeline / Mechanism**: Step-by-step detail of causes, working principles, or chronological events.
+     - **Key Nuances & Critical Sub-components**: Detailed coverage of all relevant parts.
+     - **Real-World Intuition / Everyday Analogy**: An intuitive example making it effortless to understand.
+     - **Exam & Scoring Takeaways**: High-value keywords, dates, equations, or concepts examiners look for.
+
+4. **DEEP CONVERSATIONAL CONTINUITY & PRONOUN RESOLUTION**:
+   - The user often refers to previous concepts or people using pronouns (e.g., 'unka', 'unke', 'iski', 'ye', 'yeh', 'unke life ko', 'he', 'they', 'their works').
+   - ALWAYS maintain thread continuity with the subject discussed in previous turns (${resolvedSubject || 'previous subject'}). Never disconnect or treat them as unrelated!
+
+5. **NEVER NAG OR PUSH THE STUDENT TO RETURN TO THE BOOK**:
+   - NEVER say: "Would you like to return to your English textbook now?", "Ready to tackle Intext Questions on Page X?", or "Shall we go back to the lesson?".
+   - Let the conversation flow naturally wherever the student's curiosity leads.
+
+6. **INTELLIGENT DOCUMENT GROUNDING (ONLY WHEN SPECIFICALLY ASKED ABOUT THE DOCUMENT)**:
+   - When the student specifically asks about their document (e.g. "is page par kya hai", "summarize chapter 1", "intext question 1.3 ka answer", "what did the crow do in the story", "exercise 2.1"):
+     - Ground your answer in the provided document passages with 100% precision.
+     - Cite the page cleanly using \`[Page X]\` so the student can jump to it.
+
+7. **TOP-NOTCH STRUCTURE & ACADEMIC VALUE**:
+   - Use clean Markdown with bold concept names, structured bullet points, comparison tables (\`| Feature | A | B |\`) when comparing, and clean LaTeX math notation ($E = mc^2$, $F = ma$) for equations.
+   - Deliver clear historical, scientific, or conceptual breakdowns with cause-and-effect clarity.
+
+8. **ZERO REFUSALS ABOUT IMAGES, VISUALS, OR FILES**:
+   - NEVER say: "Main yahan direct image/file nahi bhej sakta", "I cannot send images", or give a verbal excuse instead of helping.
+   - Our system natively renders authentic educational visuals, Wikimedia archive images, and Mermaid flowcharts. Never claim you lack image capability.
+
+${liveInternetGrounding ? `### LIVE VERIFIED INTERNET KNOWLEDGE & ENCYCLOPEDIC GROUNDING:\n${liveInternetGrounding}\n` : ''}
 ${historyFormatted ? `${historyFormatted}\n=======================================================\n` : ''}=======================================================
-STUDENT SESSION INFO:
-- Open PDF: "${docTitle || 'None'}" (Total Pages: ${totalPages || 1})
+STUDENT SESSION CONTEXT:
 - Current Question: "${userQuestion}"
+${resolvedSubject && resolvedSubject !== userQuestion ? `- Active Resolved Subject / Antecedent: "${resolvedSubject}" (Use this to resolve pronouns like 'unke', 'iski', 'ye', 'he', 'they', etc.)` : ''}
 =======================================================
 
-${(chapterText || fullContext) ? `REFERENCE PASSAGES FROM CURRENT DOCUMENT (Use if relevant, but answer freely beyond them if needed):
-${chapterText || fullContext}` : '(No reference document needed)'}
+${isDocQuery && (chapterText || fullContext) ? `REFERENCE PASSAGES FROM CURRENT DOCUMENT (Specific to document inquiry):
+${chapterText || fullContext}` : '(General/External Academic Inquiry — Answer authoritatively using complete intelligence and verified internet grounding)'}
 
-Provide the complete, direct, and high-quality educational answer to the student now:`;
+Provide the complete, direct, exhaustive high-intelligence answer now in ${userLang}:`;
+
+      // Specific user engine preference handling
+      if ((preferredEngine === 'deepseek' || preferredEngine === 'openrouter-deepseek') && (process.env.OPENROUTER_API_KEY || process.env.OPENROUTER_AI)) {
+        const orResult = await executeWithOpenRouter(hybridPrompt, "You are the S.A.Y.A.D. Super-Tutor Lead Academic Professor.", 0.25, "deepseek/deepseek-chat");
+        if (orResult && orResult.text) {
+          return res.json({ text: sanitizeAIResponse(orResult.text), status: "success", engine: "deepseek-v3", provider: "openrouter" });
+        }
+      }
+
+      if ((preferredEngine === 'llama' || preferredEngine === 'openrouter-llama') && (process.env.OPENROUTER_API_KEY || process.env.OPENROUTER_AI)) {
+        const orResult = await executeWithOpenRouter(hybridPrompt, "You are the S.A.Y.A.D. Super-Tutor Lead Academic Professor.", 0.25, "meta-llama/llama-3.3-70b-instruct");
+        if (orResult && orResult.text) {
+          return res.json({ text: sanitizeAIResponse(orResult.text), status: "success", engine: "openrouter-llama-3.3-70b", provider: "openrouter" });
+        }
+      }
 
       // Tier 1: Try Gemini Key Pool with powerful models (Dedicated Chat Pool with 5 keys or user customKey)
       if (keyPool.hasAnyKey() || customKey) {
         try {
           const result = await executeWithGeminiPool('chat', hybridPrompt, {
+            systemInstruction: `You are an elite, state-of-the-art AI Super-Intelligence operating with the exact intelligence, sharp intuition, and natural conversational mastery of ChatGPT (GPT-4o) and Claude (Sonnet 3.5). Strictly match the student's language: Hinglish if they talk in Hinglish, Hindi if in Hindi, and English if in English.`,
             targetModel: "gemini-3.1-flash-lite",
-            temperature: 0.3,
+            temperature: 0.25,
             customKey,
           });
 
           if (result && result.text) {
             return res.json({
-              text: result.text,
+              text: sanitizeAIResponse(result.text),
               status: "success",
-              engine: `gemini-${result.model}`,
+              engine: result.model.startsWith("gemini-") ? result.model : `gemini-${result.model}`,
               keySlot: result.keyTag,
             });
           }
@@ -964,19 +2019,29 @@ Provide the complete, direct, and high-quality educational answer to the student
         }
       }
 
-      // Tier 2: Open-Source LLaMA / GPT on Groq (High speed, instant responses)
-      if (process.env.GROQ_API_KEY) {
-        const groqText = await executeWithGroq(hybridPrompt, "You are the S.A.Y.A.D. Super-Tutor Lead Academic Professor.", 0.3);
-        if (groqText) {
-          return res.json({ text: groqText, status: "success", engine: "groq-gpt-oss-120b" });
+      // Tier 2: OpenRouter DeepSeek V3 / LLaMA 3.3 70B (State of the art reasoning & fast responses)
+      if (process.env.OPENROUTER_API_KEY || process.env.OPENROUTER_AI) {
+        const orResult = await executeWithOpenRouter(
+          hybridPrompt,
+          "You are an elite AI Super-Intelligence operating with the exact intelligence and natural conversational mastery of ChatGPT (GPT-4o) and Claude (Sonnet 3.5). Strictly match the user's language (Hinglish/Hindi/English).",
+          0.25,
+          "deepseek/deepseek-chat"
+        );
+        if (orResult && orResult.text) {
+          return res.json({
+            text: sanitizeAIResponse(orResult.text),
+            status: "success",
+            engine: `openrouter-${orResult.model.split('/').pop()}`,
+            provider: "openrouter"
+          });
         }
       }
 
-      // Tier 3: OpenRouter LLaMA 3.3 70B
-      if (process.env.OPENROUTER_API_KEY || process.env.OPENROUTER_AI) {
-        const orText = await executeWithOpenRouter(hybridPrompt, "You are the S.A.Y.A.D. Super-Tutor Lead Academic Professor.", 0.3);
-        if (orText) {
-          return res.json({ text: orText, status: "success", engine: "openrouter-llama-3.3-70b" });
+      // Tier 3: Open-Source LLaMA / GPT on Groq (High speed, instant responses)
+      if (process.env.GROQ_API_KEY) {
+        const groqText = await executeWithGroq(hybridPrompt, "You are the S.A.Y.A.D. Super-Tutor Lead Academic Professor.", 0.3);
+        if (groqText) {
+          return res.json({ text: sanitizeAIResponse(groqText), status: "success", engine: "groq-gpt-oss-120b" });
         }
       }
 
@@ -984,6 +2049,41 @@ Provide the complete, direct, and high-quality educational answer to the student
     } catch (err: any) {
       console.error("Hybrid Tutor Server Error:", err);
       return res.status(500).json({ error: err.message || "Failed to generate hybrid AI response" });
+    }
+  });
+
+  // Dedicated AI Visual Generation Endpoint
+  app.post("/api/ai/image", async (req, res) => {
+    try {
+      const { prompt } = req.body;
+      if (!prompt || typeof prompt !== "string") {
+        return res.status(400).json({ error: "Prompt string is required for image generation" });
+      }
+
+      // 1. First try authentic free educational internet media (Wikipedia / Wikimedia Commons)
+      const netImg = await fetchEducationalInternetImage(prompt);
+      if (netImg && netImg.imageUrl) {
+        const proxyUrl = `/api/image-proxy?url=${encodeURIComponent(netImg.imageUrl)}&subject=${encodeURIComponent(netImg.title)}`;
+        return res.json({
+          status: "success",
+          imageUrl: proxyUrl,
+          title: netImg.title,
+          description: netImg.description,
+          source: netImg.source,
+          isInternetAuthentic: true
+        });
+      }
+
+      // 2. Fallback to OpenRouter generative image
+      const img = await generateAIImage(prompt);
+      if (img && img.imageUrl) {
+        const proxyUrl = `/api/image-proxy?url=${encodeURIComponent(img.imageUrl)}&subject=${encodeURIComponent(prompt)}`;
+        return res.json({ status: "success", imageUrl: proxyUrl, description: img.description });
+      }
+      return res.status(500).json({ error: "Image generation model was unable to generate visual." });
+    } catch (err: any) {
+      console.error("Image generation error:", err);
+      return res.status(500).json({ error: err.message || "Failed to generate image" });
     }
   });
 

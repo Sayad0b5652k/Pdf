@@ -110,6 +110,81 @@ body {
   font-family: 'IBM Plex Mono', monospace;
 }
 
+/* ================= Mermaid Flowcharts & Diagram Lightbox Styling ================= */
+.mermaid-block-wrapper svg {
+  max-width: 100% !important;
+  height: auto !important;
+  overflow: visible !important;
+}
+
+.mermaid svg .node rect,
+.mermaid svg .node polygon,
+.mermaid svg .node circle,
+.mermaid svg .node path,
+#lb-svg-card svg .node rect,
+#lb-svg-card svg .node polygon,
+#lb-svg-card svg .node circle,
+#lb-svg-card svg .node path {
+  fill: #eff6ff !important;
+  stroke: #2563eb !important;
+  stroke-width: 1.5px !important;
+}
+
+[data-theme="dark"] .mermaid svg .node rect,
+[data-theme="dark"] .mermaid svg .node polygon,
+[data-theme="dark"] .mermaid svg .node circle,
+[data-theme="dark"] .mermaid svg .node path {
+  fill: #1e293b !important;
+  stroke: #60a5fa !important;
+  stroke-width: 1.5px !important;
+}
+
+.mermaid svg .node .label,
+.mermaid svg .node text,
+.mermaid svg .node span,
+.mermaid svg .node div,
+#lb-svg-card svg .node .label,
+#lb-svg-card svg .node text,
+#lb-svg-card svg .node span,
+#lb-svg-card svg .node div {
+  fill: #0f172a !important;
+  color: #0f172a !important;
+  font-family: inherit !important;
+  font-weight: 600 !important;
+  font-size: 13px !important;
+}
+
+[data-theme="dark"] .mermaid svg .node .label,
+[data-theme="dark"] .mermaid svg .node text,
+[data-theme="dark"] .mermaid svg .node span,
+[data-theme="dark"] .mermaid svg .node div {
+  fill: #f8fafc !important;
+  color: #f8fafc !important;
+}
+
+.mermaid svg .edgePath path,
+#lb-svg-card svg .edgePath path {
+  stroke: #64748b !important;
+  stroke-width: 2px !important;
+}
+
+.mermaid svg marker path,
+#lb-svg-card svg marker path {
+  fill: #64748b !important;
+  stroke: #64748b !important;
+}
+
+[data-theme="dark"] .mermaid svg .edgePath path,
+[data-theme="dark"] #lb-svg-card svg .edgePath path {
+  stroke: #94a3b8 !important;
+}
+
+[data-theme="dark"] .mermaid svg marker path,
+[data-theme="dark"] #lb-svg-card svg marker path {
+  fill: #94a3b8 !important;
+  stroke: #94a3b8 !important;
+}
+
 button {
   font-family: inherit;
 }

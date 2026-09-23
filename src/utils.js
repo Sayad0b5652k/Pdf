@@ -181,9 +181,14 @@ export function cleanRawMathAndSymbols(text) {
   s = s.replace(/\\textit\{([^}]+)\}/g, '*$1*');
   s = s.replace(/\\mathrm\{([^}]+)\}/g, '$1');
   s = s.replace(/\\mathbf\{([^}]+)\}/g, '$1');
-  s = s.replace(/\\text\{([^}]+)\}/g, '$1');
-  s = s.replace(/\\operatorname\{([^}]+)\}/g, '$1');
 
+  // If KaTeX is available (or will auto-render), preserve $$ and $ math blocks intact!
+  if (typeof window.katex !== 'undefined' || typeof window.renderMathInElement === 'function') {
+    // Preserve math blocks for KaTeX renderer
+    return s;
+  }
+
+  // Fallback cleaner for environments where KaTeX is not loaded:
   // Replace double dollar display math with clean block math
   s = s.replace(/\$\$([\s\S]+?)\$\$/g, (_, eq) => {
     let cleanEq = eq
@@ -257,6 +262,11 @@ export function cleanRawMathAndSymbols(text) {
   // Clean up weird backslash-escaped characters that AI sometimes outputs like \* or \#
   s = s.replace(/\\([*#_`~[\]()])/g, '$1');
 
+  // Clean robotic AI disclaimers or book nagging phrases
+  s = s.replace(/\s*\(\s*(?:External Knowledge|Web Search|Book ke bahar se)[^)]*\)/gi, '');
+  s = s.replace(/\*+\s*\(\s*(?:External Knowledge|Web Search|Book ke bahar se)[^)]*\)\s*\*+/gi, '');
+  s = s.replace(/(?:Would you like to (?:continue with|return to) your .*? textbook|Ready to (?:return to|tackle) .*?\?)\s*$/gi, '');
+
   return s;
 }
 
@@ -264,11 +274,13 @@ export function renderMarkdown(raw){
   const sanitized = cleanRawMathAndSymbols(raw || '');
   const lines = sanitized.replace(/\r\n/g,'\n').split('\n');
   let html = '', listType = null, paraBuffer = [];
-  let inCodeBlock = false, codeBuffer = [];
+  let inCodeBlock = false, codeBuffer = [], codeBlockLang = '';
   let inTable = false, tableRows = [];
 
   const inline = (s)=>{
+    // Escape HTML first to prevent XSS
     s = escapeHtml(s);
+
     // Triple asterisks bold-italic: ***text***
     s = s.replace(/\*\*\*(.+?)\*\*\*/g, '<strong style="color:var(--text); font-weight:700;"><em style="color:var(--text);">$1</em></strong>');
     // Double asterisks bold: **text**
@@ -290,8 +302,68 @@ export function renderMarkdown(raw){
 
     return s;
   };
+
+  const createVisualCardHtml = (cleanAlt, safeUrl) => {
+    const escapedAlt = escapeHtml(cleanAlt || 'Educational Visual');
+    const escapedSafeAltParam = (cleanAlt || 'Educational Visual').replace(/['"\\]/g, ' ');
+    const downloadFilename = (cleanAlt || 'visual').replace(/[^a-zA-Z0-9_-]/g, '_');
+    const cleanUrl = (safeUrl || '').trim();
+    // Default to proxied URL for 100% reliable bypass of carrier blocks, CORS, and referer restrictions
+    const initialSrc = (cleanUrl.startsWith('/api/') || cleanUrl.startsWith('data:'))
+      ? cleanUrl
+      : `/api/image-proxy?url=${encodeURIComponent(cleanUrl)}&subject=${encodeURIComponent(cleanAlt || '')}`;
+
+    return `
+      <div class="ai-generated-visual-card" style="margin:16px 0; border:1px solid var(--border); border-radius:14px; overflow:hidden; background:var(--surface-2); box-shadow:0 4px 20px rgba(0,0,0,0.08);">
+        <div style="position:relative; width:100%; min-height:220px; max-height:460px; overflow:hidden; display:flex; justify-content:center; align-items:center; background:rgba(0,0,0,0.03); cursor:zoom-in;" onclick="window.openImageLightbox && window.openImageLightbox('${initialSrc}', '${escapedSafeAltParam}')" title="Click to open, zoom and pan in high-res">
+          <img src="${initialSrc}" alt="${escapedAlt}" loading="eager" decoding="async" onerror="window.handleCardImageFallback && window.handleCardImageFallback(this, '${cleanUrl.replace(/'/g, "\\'")}', '${escapedSafeAltParam}')" style="max-width:100%; max-height:460px; object-fit:contain; transition:transform 0.25s ease;" />
+          <div style="position:absolute; bottom:10px; right:10px; background:rgba(0,0,0,0.7); backdrop-filter:blur(6px); color:#fff; font-size:11px; font-weight:600; padding:4px 10px; border-radius:20px; display:flex; align-items:center; gap:4px; pointer-events:none;">
+            <span>🔍 Tap to Zoom</span>
+          </div>
+        </div>
+        <div style="padding:10px 14px; display:flex; align-items:center; justify-content:space-between; gap:10px; border-top:1px solid var(--border); background:var(--surface);">
+          <div style="display:flex; align-items:center; gap:6px; min-width:0;">
+            <span style="font-size:14px;">🖼️</span>
+            <span style="font-size:12.5px; font-weight:700; color:var(--text); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" title="${escapedAlt}">${escapedAlt}</span>
+          </div>
+          <div style="display:flex; align-items:center; gap:6px; flex-shrink:0;">
+            <button class="btn" onclick="window.openImageLightbox && window.openImageLightbox('${initialSrc}', '${escapedSafeAltParam}')" style="height:28px; padding:0 10px; font-size:11.5px; font-weight:600; border-radius:6px; background:var(--surface-2); border:1px solid var(--border); color:var(--text); cursor:pointer; display:inline-flex; align-items:center; gap:4px;">
+              <span>🔍 Zoom</span>
+            </button>
+            <a href="${initialSrc}" download="${downloadFilename}.png" target="_blank" class="btn" style="height:28px; padding:0 10px; font-size:11.5px; font-weight:600; border-radius:6px; background:var(--accent-soft); border:1px solid var(--accent); color:var(--accent); text-decoration:none; display:inline-flex; align-items:center; gap:4px;">
+              <span>⬇️ Download</span>
+            </a>
+          </div>
+        </div>
+      </div>`;
+  };
+
   const flushPara = ()=>{
-    if(paraBuffer.length){ html += `<p style="margin:0 0 10px; line-height:1.68; font-size:14px; color:var(--text);">${inline(paraBuffer.join(' '))}</p>`; paraBuffer = []; }
+    if(paraBuffer.length){
+      const text = paraBuffer.join(' ');
+      // Check if paragraph contains markdown images (supports both /api/image-proxy and absolute URLs)
+      const imgRegex = /!\[(.*?)\]\(((?:https?:\/\/|\/api\/|\/)[^\r\n()]+(?:\([^\r\n()]+\)[^\r\n()]*)*)\)(?=\s|$)/g;
+      if (imgRegex.test(text)) {
+        let lastIdx = 0;
+        let m;
+        imgRegex.lastIndex = 0;
+        while ((m = imgRegex.exec(text)) !== null) {
+          const before = text.slice(lastIdx, m.index).trim();
+          if (before) {
+            html += `<p style="margin:0 0 10px; line-height:1.68; font-size:14px; color:var(--text);">${inline(before)}</p>`;
+          }
+          html += createVisualCardHtml(m[1], m[2]);
+          lastIdx = m.index + m[0].length;
+        }
+        const after = text.slice(lastIdx).trim();
+        if (after) {
+          html += `<p style="margin:0 0 10px; line-height:1.68; font-size:14px; color:var(--text);">${inline(after)}</p>`;
+        }
+      } else {
+        html += `<p style="margin:0 0 10px; line-height:1.68; font-size:14px; color:var(--text);">${inline(text)}</p>`;
+      }
+      paraBuffer = [];
+    }
   };
   const closeList = ()=>{ if(listType){ html += `</${listType}>`; listType = null; } };
 
@@ -318,15 +390,44 @@ export function renderMarkdown(raw){
   for(const rawLine of lines){
     const line = rawLine.trim();
 
-    // Code block toggle (``` or ```ascii or ```tree)
+    // Code block toggle (``` or ```ascii or ```tree or ```mermaid)
     if (line.startsWith('```')) {
       if (inCodeBlock) {
-        html += `<pre class="no-scrollbar" style="background:var(--surface-2); border:1px solid var(--border); border-radius:10px; padding:12px 14px; font-family:'Courier New', Consolas, monospace; font-size:12.5px; line-height:1.55; color:var(--text); overflow-x:auto; margin:12px 0; white-space:pre; scrollbar-width:none; -ms-overflow-style:none;"><code>${escapeHtml(codeBuffer.join('\n'))}</code></pre>`;
+        const isMermaid = codeBlockLang === 'mermaid' || codeBuffer.some(l => /^(?:graph|flowchart|sequenceDiagram|classDiagram|stateDiagram|erDiagram|journey|gantt|pie|quadrantChart|mindmap|timeline)\b/i.test(l.trim()));
+        if (isMermaid) {
+          const rawDiagram = codeBuffer.join('\n').trim();
+          html += `
+            <div class="mermaid-block-wrapper" style="margin:16px 0; border:1px solid var(--border); border-radius:14px; background:var(--surface-2); overflow:hidden; box-shadow:0 4px 18px rgba(0,0,0,0.06);">
+              <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:6px; padding:8px 12px; background:var(--surface-3, var(--surface)); border-bottom:1px solid var(--border); font-size:12px; font-weight:700; color:var(--text);">
+                <span style="display:flex; align-items:center; gap:5px; color:var(--accent); min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:11.5px;">
+                  <span>📊 Flowchart</span>
+                </span>
+                <div style="display:flex; align-items:center; gap:4px; flex-shrink:0; margin-left:auto;">
+                  <button class="btn btn-zoom-diagram" onclick="window.openDiagramLightbox && window.openDiagramLightbox(this)" title="Open in Fullscreen &amp; Zoom" style="height:24px; padding:0 8px; font-size:11px; font-weight:600; border-radius:6px; background:var(--surface-2); border:1px solid var(--border); color:var(--text); cursor:pointer; display:inline-flex; align-items:center; gap:3px; flex-shrink:0; white-space:nowrap;">
+                    <span>🔍 Zoom</span>
+                  </button>
+                  <button class="btn btn-download-diagram" onclick="window.downloadDiagram && window.downloadDiagram(this)" title="Download Diagram as Image" style="height:24px; padding:0 8px; font-size:11px; font-weight:600; border-radius:6px; background:var(--accent-soft); border:1px solid var(--accent); color:var(--accent); cursor:pointer; display:inline-flex; align-items:center; gap:3px; flex-shrink:0; white-space:nowrap;">
+                    <span>⬇️ Save</span>
+                  </button>
+                  <button class="btn btn-copy-diagram" onclick="window.copyToClipboard && window.copyToClipboard('${escapeHtml(rawDiagram).replace(/'/g, "\\'")}', this)" style="height:24px; padding:0 7px; font-size:11px; font-weight:600; border-radius:6px; background:var(--surface-2); border:1px solid var(--border); color:var(--text-dim); cursor:pointer; flex-shrink:0; white-space:nowrap;">
+                    <span>📋 Code</span>
+                  </button>
+                </div>
+              </div>
+              <div class="diagram-render-area" style="padding:16px 12px; overflow-x:auto; text-align:center; min-height:80px; background:var(--surface); display:flex; justify-content:center; align-items:center;">
+                <div class="mermaid" style="display:flex; justify-content:center; width:100%; min-height:60px;">${escapeHtml(rawDiagram)}</div>
+              </div>
+            </div>`;
+        } else {
+          html += `<pre class="no-scrollbar" style="background:var(--surface-2); border:1px solid var(--border); border-radius:10px; padding:12px 14px; font-family:'Courier New', Consolas, monospace; font-size:12.5px; line-height:1.55; color:var(--text); overflow-x:auto; margin:12px 0; white-space:pre; scrollbar-width:none; -ms-overflow-style:none;"><code>${escapeHtml(codeBuffer.join('\n'))}</code></pre>`;
+        }
         codeBuffer = [];
         inCodeBlock = false;
+        codeBlockLang = '';
       } else {
         flushPara(); closeList(); flushTable();
         inCodeBlock = true;
+        codeBlockLang = line.replace(/^```/, '').trim().toLowerCase();
         codeBuffer = [];
       }
       continue;
@@ -348,6 +449,15 @@ export function renderMarkdown(raw){
     }
 
     if(!line){ flushPara(); closeList(); continue; }
+
+    // Standalone Markdown Image Line: ![alt](url)
+    const blockImgMatch = line.match(/^!\[(.*?)\]\((https?:\/\/[^\s)]+)\)$/);
+    if (blockImgMatch) {
+      flushPara(); closeList();
+      html += createVisualCardHtml(blockImgMatch[1], blockImgMatch[2]);
+      continue;
+    }
+
     let m;
     if((m = line.match(/^#{1,6}\s*(.*)$/))){
       flushPara(); closeList();
@@ -690,6 +800,364 @@ if (typeof window !== 'undefined') {
   });
 }
 
+export function renderMermaidDiagrams(container) {
+  if (typeof window.mermaid !== 'undefined') {
+    try {
+      const isDark = document.documentElement.dataset.theme === 'dark' || document.documentElement.classList.contains('dark') || window.State?.theme === 'dark';
+      window.mermaid.initialize({
+        startOnLoad: false,
+        theme: isDark ? 'dark' : 'default',
+        themeVariables: {
+          darkMode: isDark,
+          primaryColor: isDark ? '#1e293b' : '#eff6ff',
+          primaryTextColor: isDark ? '#f8fafc' : '#0f172a',
+          primaryBorderColor: isDark ? '#3b82f6' : '#2563eb',
+          lineColor: isDark ? '#60a5fa' : '#3b82f6',
+          secondaryColor: isDark ? '#0f172a' : '#f8fafc',
+          tertiaryColor: isDark ? '#1e1e2e' : '#ffffff',
+          edgeLabelBackground: isDark ? '#1e293b' : '#ffffff'
+        },
+        securityLevel: 'loose',
+        flowchart: { useMaxWidth: true, htmlLabels: true, curve: 'basis' }
+      });
+      const nodes = (container || document).querySelectorAll('.mermaid:not([data-processed="true"])');
+      if (nodes.length > 0) {
+        window.mermaid.run({ nodes }).catch(e => {
+          console.warn('Mermaid render error:', e);
+        });
+      }
+    } catch(err) {
+      console.warn('Mermaid initialization warning:', err);
+    }
+  }
+}
+
+export function renderMathFormulas(container) {
+  if (typeof window.renderMathInElement === 'function') {
+    try {
+      window.renderMathInElement(container || document.body, {
+        delimiters: [
+          { left: '$$', right: '$$', display: true },
+          { left: '$', right: '$', display: false },
+          { left: '\\(', right: '\\)', display: false },
+          { left: '\\[', right: '\\]', display: true }
+        ],
+        throwOnError: false
+      });
+    } catch (e) {
+      console.warn('KaTeX math render warning:', e);
+    }
+  }
+}
+
+export function openImageLightbox(src, caption, options = {}) {
+  const existing = document.getElementById('ai-image-lightbox');
+  if (existing) existing.remove();
+
+  let zoom = 1.0;
+  let panX = 0;
+  let panY = 0;
+  let isDragging = false;
+  let startX = 0;
+  let startY = 0;
+  let touchStartDist = 0;
+  let touchStartZoom = 1.0;
+
+  const isSvg = options.isSvg || false;
+  const svgHtml = options.svgHtml || '';
+
+  const modal = document.createElement('div');
+  modal.id = 'ai-image-lightbox';
+  modal.style.cssText = 'position:fixed; inset:0; z-index:99999; background:rgba(5,9,14,0.94); backdrop-filter:blur(12px); display:flex; flex-direction:column; align-items:center; justify-content:space-between; padding:14px; user-select:none; -webkit-user-select:none; animation:fadeIn 0.18s ease;';
+
+  const cleanCaption = caption || (isSvg ? 'Academic Flowchart' : 'Educational Visual');
+  const fileName = cleanCaption.replace(/[^a-zA-Z0-9_-]/g, '_') || 'academic-visual';
+
+  modal.innerHTML = `
+    <!-- Top Control Toolbar -->
+    <div style="width:100%; max-width:960px; display:flex; align-items:center; justify-content:space-between; gap:10px; z-index:20; background:rgba(20,28,38,0.8); backdrop-filter:blur(10px); border:1px solid rgba(255,255,255,0.15); border-radius:12px; padding:8px 12px;">
+      <div style="display:flex; align-items:center; gap:8px; min-width:0;">
+        <span style="font-size:16px;">${isSvg ? '📊' : '🖼️'}</span>
+        <span style="color:#fff; font-size:12.5px; font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:280px;">${escapeHtml(cleanCaption)}</span>
+      </div>
+      <div style="display:flex; align-items:center; gap:6px;">
+        <!-- Zoom Controls -->
+        <div style="display:inline-flex; align-items:center; background:rgba(0,0,0,0.45); border:1px solid rgba(255,255,255,0.15); border-radius:8px; padding:2px;">
+          <button id="lb-zoom-out" class="btn btn-icon" title="Zoom Out (-)" style="width:28px; height:28px; color:#fff; font-size:16px; font-weight:700; border:none; background:transparent; cursor:pointer;">−</button>
+          <span id="lb-zoom-level" style="color:var(--accent, #4ade80); font-size:11.5px; font-weight:700; font-family:monospace; padding:0 6px; min-width:42px; text-align:center;">100%</span>
+          <button id="lb-zoom-in" class="btn btn-icon" title="Zoom In (+)" style="width:28px; height:28px; color:#fff; font-size:16px; font-weight:700; border:none; background:transparent; cursor:pointer;">+</button>
+          <button id="lb-zoom-reset" class="btn" title="Reset Zoom (1:1)" style="height:24px; padding:0 8px; font-size:10.5px; font-weight:600; color:#fff; border:none; background:rgba(255,255,255,0.15); border-radius:6px; margin-left:3px; cursor:pointer;">1:1</button>
+        </div>
+
+        <!-- Download Button -->
+        ${isSvg ? `
+          <button id="lb-download-btn" class="btn" title="Save Flowchart Image" style="height:30px; padding:0 10px; font-size:11.5px; font-weight:600; background:var(--accent, #3b82f6); color:#fff; border-radius:8px; border:none; display:inline-flex; align-items:center; gap:4px; cursor:pointer; white-space:nowrap;">
+            <span>⬇️ Save</span>
+          </button>
+        ` : `
+          <a id="lb-download-btn" href="${src}" download="${fileName}.png" target="_blank" class="btn" style="height:30px; padding:0 10px; font-size:11.5px; font-weight:600; background:var(--accent, #3b82f6); color:#fff; border-radius:8px; border:none; text-decoration:none; display:inline-flex; align-items:center; gap:4px; cursor:pointer; white-space:nowrap;">
+            <span>⬇️ Save</span>
+          </a>
+        `}
+
+        <!-- Close Button -->
+        <button id="close-lightbox-btn" class="btn btn-icon" title="Close (Esc)" style="width:30px; height:30px; border-radius:50%; background:rgba(255,255,255,0.18); color:#fff; border:none; cursor:pointer; font-size:13px; font-weight:700;">✕</button>
+      </div>
+    </div>
+
+    <!-- Center Viewport with Hardware-Accelerated Smooth Transform -->
+    <div id="lb-viewport" style="position:relative; width:100%; height:calc(100vh - 120px); overflow:hidden; display:flex; align-items:center; justify-content:center; cursor:grab; touch-action:none;">
+      <div id="lb-transform-box" style="display:flex; align-items:center; justify-content:center; transform-origin:center center; will-change:transform; transform:translate3d(0,0,0) scale(1);">
+        ${isSvg ? `
+          <div id="lb-svg-card" style="background:var(--surface, #ffffff); border:1px solid var(--border, rgba(255,255,255,0.15)); border-radius:14px; padding:22px 26px; box-shadow:0 18px 56px rgba(0,0,0,0.6); max-width:92vw; max-height:80vh; overflow:auto; display:flex; align-items:center; justify-content:center; color:var(--text, #0f172a); pointer-events:none;">
+            ${svgHtml || ''}
+          </div>
+        ` : `
+          <img id="lb-image" src="${src}" alt="${escapeHtml(cleanCaption)}" loading="eager" decoding="async" onerror="if(!this.dataset.proxied && !'${src}'.startsWith('/api/')){this.dataset.proxied='1'; this.src='/api/image-proxy?url=' + encodeURIComponent('${src}') + '&subject=' + encodeURIComponent('${cleanCaption}');}" style="max-width:90vw; max-height:80vh; object-fit:contain; border-radius:8px; box-shadow:0 14px 48px rgba(0,0,0,0.7); pointer-events:none;" />
+        `}
+      </div>
+    </div>
+
+    <!-- Bottom Zoom / Pan Tip -->
+    <div style="font-size:11px; color:rgba(255,255,255,0.65); padding:5px 12px; background:rgba(0,0,0,0.5); border-radius:20px; z-index:20; pointer-events:none;">
+      💡 Pinch or Scroll to Zoom • Drag to Pan • 1:1 to reset
+    </div>
+  `;
+
+  document.body.appendChild(modal);
+
+  const transformBox = modal.querySelector('#lb-transform-box');
+  const zoomLevelEl = modal.querySelector('#lb-zoom-level');
+  const viewport = modal.querySelector('#lb-viewport');
+
+  const updateTransform = () => {
+    if (!transformBox) return;
+    transformBox.style.transform = `translate3d(${panX}px, ${panY}px, 0px) scale(${zoom})`;
+    if (zoomLevelEl) {
+      zoomLevelEl.textContent = `${Math.round(zoom * 100)}%`;
+    }
+    if (viewport) {
+      viewport.style.cursor = zoom > 1 ? (isDragging ? 'grabbing' : 'grab') : 'grab';
+    }
+  };
+
+  const setZoom = (newZoom, animated = true) => {
+    zoom = Math.max(0.5, Math.min(5.0, newZoom));
+    if (zoom <= 1) {
+      panX = 0;
+      panY = 0;
+    }
+    if (transformBox) {
+      transformBox.style.transition = animated ? 'transform 0.16s cubic-bezier(0.2, 0, 0, 1)' : 'none';
+    }
+    updateTransform();
+  };
+
+  // Zoom In / Out / Reset
+  modal.querySelector('#lb-zoom-in').onclick = (e) => { e.stopPropagation(); setZoom(zoom + 0.35, true); };
+  modal.querySelector('#lb-zoom-out').onclick = (e) => { e.stopPropagation(); setZoom(zoom - 0.35, true); };
+  modal.querySelector('#lb-zoom-reset').onclick = (e) => { e.stopPropagation(); panX = 0; panY = 0; setZoom(1.0, true); };
+
+  // If SVG, wire custom download button to trigger high-res export
+  if (isSvg && options.triggerBtn) {
+    const dlBtn = modal.querySelector('#lb-download-btn');
+    if (dlBtn) {
+      dlBtn.onclick = (e) => {
+        e.stopPropagation();
+        downloadDiagram(options.triggerBtn);
+      };
+    }
+  }
+
+  // Mouse Drag / Pointer Pan (Zero Lag)
+  viewport.onpointerdown = (e) => {
+    isDragging = true;
+    startX = e.clientX - panX;
+    startY = e.clientY - panY;
+    if (transformBox) transformBox.style.transition = 'none';
+    viewport.setPointerCapture(e.pointerId);
+    viewport.style.cursor = 'grabbing';
+  };
+
+  viewport.onpointermove = (e) => {
+    if (!isDragging) return;
+    panX = e.clientX - startX;
+    panY = e.clientY - startY;
+    updateTransform();
+  };
+
+  viewport.onpointerup = (e) => {
+    isDragging = false;
+    try { viewport.releasePointerCapture(e.pointerId); } catch(err) {}
+    viewport.style.cursor = zoom > 1 ? 'grab' : 'default';
+  };
+
+  viewport.onpointercancel = viewport.onpointerup;
+
+  // Mouse Wheel to Zoom
+  viewport.onwheel = (e) => {
+    e.preventDefault();
+    const delta = e.deltaY < 0 ? 0.25 : -0.25;
+    setZoom(zoom + delta, false);
+  };
+
+  // Touch Pinch-to-Zoom (Smooth 60fps)
+  viewport.ontouchstart = (e) => {
+    if (e.touches.length === 2) {
+      const dx = e.touches[0].clientX - e.touches[1].clientX;
+      const dy = e.touches[0].clientY - e.touches[1].clientY;
+      touchStartDist = Math.hypot(dx, dy);
+      touchStartZoom = zoom;
+      if (transformBox) transformBox.style.transition = 'none';
+    }
+  };
+
+  viewport.ontouchmove = (e) => {
+    if (e.touches.length === 2 && touchStartDist > 0) {
+      e.preventDefault();
+      const dx = e.touches[0].clientX - e.touches[1].clientX;
+      const dy = e.touches[0].clientY - e.touches[1].clientY;
+      const dist = Math.hypot(dx, dy);
+      const factor = dist / touchStartDist;
+      zoom = Math.max(0.5, Math.min(5.0, touchStartZoom * factor));
+      updateTransform();
+    }
+  };
+
+  // Close Handlers
+  const closeModal = () => {
+    modal.remove();
+    window.removeEventListener('keydown', handleKey);
+  };
+
+  const handleKey = (e) => {
+    if (e.key === 'Escape') closeModal();
+    if (e.key === '+' || e.key === '=') setZoom(zoom + 0.25, true);
+    if (e.key === '-' || e.key === '_') setZoom(zoom - 0.25, true);
+  };
+  window.addEventListener('keydown', handleKey);
+
+  modal.querySelector('#close-lightbox-btn').onclick = closeModal;
+}
+
+export function openDiagramLightbox(buttonEl) {
+  const wrapper = buttonEl.closest('.mermaid-block-wrapper');
+  if (!wrapper) return;
+  const svgEl = wrapper.querySelector('.mermaid svg');
+  if (!svgEl) {
+    window.toast('Diagram is still rendering, please wait…');
+    return;
+  }
+
+  try {
+    const isDark = document.documentElement.dataset.theme === 'dark' || document.documentElement.classList.contains('dark') || window.State?.theme === 'dark';
+    const clone = svgEl.cloneNode(true);
+
+    // CRITICAL: Preserve SVG id so Mermaid's embedded scoped <style> rules continue to match!
+    if (svgEl.id) {
+      clone.setAttribute('id', svgEl.id);
+    }
+    clone.style.maxWidth = '100%';
+    clone.style.height = 'auto';
+    clone.style.display = 'block';
+
+    // Apply explicit high-contrast fill and border on all flowchart nodes so they never default to black
+    const nodeFill = isDark ? '#1e293b' : '#eff6ff';
+    const nodeStroke = isDark ? '#60a5fa' : '#2563eb';
+    const textColor = isDark ? '#f8fafc' : '#0f172a';
+
+    clone.querySelectorAll('.node rect, .node polygon, .node circle, .node path').forEach(shape => {
+      shape.setAttribute('fill', nodeFill);
+      shape.setAttribute('stroke', nodeStroke);
+      shape.setAttribute('stroke-width', '1.5');
+      shape.style.fill = nodeFill;
+      shape.style.stroke = nodeStroke;
+    });
+
+    clone.querySelectorAll('.node text, .node span, .node div, .label text').forEach(txt => {
+      txt.setAttribute('fill', textColor);
+      txt.style.color = textColor;
+      txt.style.fill = textColor;
+      txt.style.fontWeight = '600';
+    });
+
+    const serializer = new XMLSerializer();
+    let svgSource = serializer.serializeToString(clone);
+    if (!svgSource.match(/^<svg[^>]+xmlns="http:\/\/www\.w3\.org\/2000\/svg"/)) {
+      svgSource = svgSource.replace(/^<svg/, '<svg xmlns="http://www.w3.org/2000/svg"');
+    }
+
+    openImageLightbox('', 'Interactive Academic Flowchart', {
+      isSvg: true,
+      svgHtml: svgSource,
+      triggerBtn: buttonEl
+    });
+  } catch (err) {
+    console.warn('Failed to open diagram lightbox:', err);
+    window.toast('Could not open diagram viewer.');
+  }
+}
+
+export function downloadDiagram(buttonEl) {
+  const wrapper = buttonEl.closest('.mermaid-block-wrapper');
+  if (!wrapper) return;
+  const svgEl = wrapper.querySelector('.mermaid svg');
+  if (!svgEl) {
+    window.toast('Diagram is still generating…');
+    return;
+  }
+
+  try {
+    const serializer = new XMLSerializer();
+    let svgSource = serializer.serializeToString(svgEl);
+    if (!svgSource.match(/^<svg[^>]+xmlns="http:\/\/www\.w3\.org\/2000\/svg"/)) {
+      svgSource = svgSource.replace(/^<svg/, '<svg xmlns="http://www.w3.org/2000/svg"');
+    }
+
+    const img = new Image();
+    const svgBlob = new Blob([svgSource], { type: 'image/svg+xml;charset=utf-8' });
+    const url = URL.createObjectURL(svgBlob);
+
+    img.onload = () => {
+      try {
+        const canvas = document.createElement('canvas');
+        const bbox = svgEl.getBoundingClientRect();
+        const scale = 2.5; // High definition export
+        canvas.width = (bbox.width || 800) * scale;
+        canvas.height = (bbox.height || 500) * scale;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          // Fill background for crisp contrast
+          ctx.fillStyle = '#ffffff';
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          const pngUrl = canvas.toDataURL('image/png');
+          const a = document.createElement('a');
+          a.download = 'academic-flowchart.png';
+          a.href = pngUrl;
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          window.toast('Flowchart downloaded as HD Image! 📊');
+        }
+      } catch (canvasErr) {
+        // Fallback: download SVG directly
+        const a = document.createElement('a');
+        a.download = 'academic-flowchart.svg';
+        a.href = url;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        window.toast('Flowchart downloaded as SVG! 📊');
+      }
+    };
+    img.src = url;
+  } catch (err) {
+    console.warn('Download diagram error:', err);
+    window.toast('Failed to download flowchart image.');
+  }
+}
+
 // Bind to window for global availability
 window.toast = toast;
 window.Sheet = Sheet;
@@ -698,6 +1166,11 @@ window.copyToClipboard = copyToClipboard;
 window.stripMarkdown = stripMarkdown;
 window.renderMarkdown = renderMarkdown;
 window.formatMarkdown = renderMarkdown; // Alias for safe markdown rendering across all views
+window.renderMermaidDiagrams = renderMermaidDiagrams;
+window.renderMathFormulas = renderMathFormulas;
+window.openImageLightbox = openImageLightbox;
+window.openDiagramLightbox = openDiagramLightbox;
+window.downloadDiagram = downloadDiagram;
 window.debounce = debounce;
 window.throttle = throttle;
 window.escapeHtml = escapeHtml;
@@ -706,3 +1179,46 @@ window.keepBottomBarPositioned = keepBottomBarPositioned;
 window.getReadingStats = getReadingStats;
 window.startReadingSession = startReadingSession;
 window.stopReadingSession = stopReadingSession;
+
+// Robust Multi-tier Fallback for Educational Visual Cards
+export function handleCardImageFallback(imgEl, originalUrl, altText) {
+  if (!imgEl) return;
+  const step = parseInt(imgEl.dataset.fallbackStep || '0', 10);
+
+  if (step === 0) {
+    // Stage 1: If proxied URL failed, attempt direct load (if not already tried)
+    imgEl.dataset.fallbackStep = '1';
+    if (originalUrl && originalUrl.startsWith('http') && imgEl.src !== originalUrl) {
+      imgEl.src = originalUrl;
+      return;
+    }
+  }
+
+  if (step <= 1) {
+    // Stage 2: Fallback query via backend proxy using clean subject
+    imgEl.dataset.fallbackStep = '2';
+    const cleanSubject = encodeURIComponent(altText || 'educational visual');
+    imgEl.src = `/api/image-proxy?subject=${cleanSubject}&fallback=1&t=${Date.now()}`;
+    return;
+  }
+
+  // Stage 3: All network sources exhausted - gracefully render elegant academic SVG card
+  imgEl.dataset.fallbackStep = '3';
+  imgEl.style.display = 'none';
+  const container = imgEl.parentElement;
+  if (container && !container.querySelector('.image-fallback-badge')) {
+    const fb = document.createElement('div');
+    fb.className = 'image-fallback-badge';
+    fb.style.cssText = 'padding:24px 16px; text-align:center; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:8px; color:var(--text);';
+    fb.innerHTML = `
+      <div style="font-size:36px; line-height:1;">🖼️</div>
+      <div style="font-size:14px; font-weight:700; color:var(--text);">${escapeHtml(altText || 'Educational Archive')}</div>
+      <div style="font-size:12px; color:var(--text-muted, #64748b);">Authentic Reference Visual</div>
+      <button class="btn" onclick="const im = this.closest('.ai-generated-visual-card')?.querySelector('img'); if(im){ im.dataset.fallbackStep='0'; im.style.display='block'; im.src='/api/image-proxy?subject=${encodeURIComponent(altText)}&t=' + Date.now(); this.parentElement.remove(); }" style="margin-top:4px; height:28px; padding:0 12px; font-size:11.5px; font-weight:600; border-radius:6px; background:var(--accent-soft); border:1px solid var(--accent); color:var(--accent); cursor:pointer;">
+        🔄 Reload Image
+      </button>
+    `;
+    container.appendChild(fb);
+  }
+}
+window.handleCardImageFallback = handleCardImageFallback;

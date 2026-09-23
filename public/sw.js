@@ -1,5 +1,5 @@
 // S.A.Y.A.D. Service Worker for Offline Study & Native WebAPK Minting
-const CACHE_NAME = 'sayad-v34-fix-range-indexsizeerror';
+const CACHE_NAME = 'sayad-v35-image-resilience';
 const PRECACHE_URLS = [
   '/',
   '/index.html',
@@ -15,9 +15,7 @@ const PRECACHE_URLS = [
   '/icons/theme-classic-512.png',
   '/icons/theme-titanium-512.png',
   '/icons/theme-glass-512.png',
-  '/icons/theme-editorial-512.png',
-  '/assets/icon-192.png',
-  '/assets/icon-512.png'
+  '/icons/theme-editorial-512.png'
 ];
 
 self.addEventListener('message', (event) => {
@@ -57,8 +55,8 @@ self.addEventListener('fetch', (event) => {
   if (event.request.method !== 'GET') return;
   const url = new URL(event.request.url);
 
-  // Ignore chrome extension & dev server hot reload
-  if (url.protocol.startsWith('chrome-extension') || url.pathname.includes('@vite')) {
+  // Ignore chrome extension, dev server hot reload & API requests
+  if (url.protocol.startsWith('chrome-extension') || url.pathname.includes('@vite') || url.pathname.startsWith('/api/')) {
     return;
   }
 

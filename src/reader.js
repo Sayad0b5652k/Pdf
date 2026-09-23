@@ -2835,26 +2835,30 @@ export async function renderPage(num){
     canvas.style.display = 'block';
 
     const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      console.warn(`Could not acquire 2d context for page ${num}`);
+      pe.rendering = false;
+      return;
+    }
+
     if(pe.renderTask){
       try{ pe.renderTask.cancel(); }catch(e){}
       pe.renderTask = null;
     }
 
-    if(ctx){
-      const renderTask = page.render({canvasContext: ctx, viewport: renderViewport});
-      pe.renderTask = renderTask;
-      try {
-        await renderTask.promise;
-      } catch (renderError) {
-        if (renderError?.name === 'RenderingCancelledException' || renderError?.message?.includes('cancelled')) {
-          pe.rendering = false;
-          return;
-        }
-        throw renderError;
-      } finally {
-        if (pe.renderTask === renderTask) {
-          pe.renderTask = null;
-        }
+    const renderTask = page.render({canvasContext: ctx, viewport: renderViewport});
+    pe.renderTask = renderTask;
+    try {
+      await renderTask.promise;
+    } catch (renderError) {
+      if (renderError?.name === 'RenderingCancelledException' || renderError?.message?.includes('cancelled')) {
+        pe.rendering = false;
+        return;
+      }
+      throw renderError;
+    } finally {
+      if (pe.renderTask === renderTask) {
+        pe.renderTask = null;
       }
     }
 
@@ -2886,7 +2890,11 @@ export async function renderPage(num){
     annotLayer.className = 'annot-layer';
 
     if (typeof window.destroyPageDrawLayer === 'function') {
-      window.destroyPageDrawLayer(num);
+      try {
+        window.destroyPageDrawLayer(num);
+      } catch (destroyErr) {
+        console.warn('destroyPageDrawLayer notice:', destroyErr);
+      }
     }
     pe.wrap.innerHTML = '';
     pe.wrap.appendChild(canvas);
@@ -2900,7 +2908,13 @@ export async function renderPage(num){
     pe.rendered = true;
     pe.rendering = false;
 
-    await window.paintAnnotations(num);
+    try {
+      if (typeof window.paintAnnotations === 'function') {
+        await window.paintAnnotations(num);
+      }
+    } catch (annotErr) {
+      console.warn(`Annotation paint notice for page ${num}:`, annotErr);
+    }
     if (window.pendingSelection && window.pendingSelection.pageNum === num && typeof window.paintPendingOverlay === 'function') {
       window.pendingSelection.pageWrap = pe.wrap;
       window.paintPendingOverlay(window.pendingSelection, true);
